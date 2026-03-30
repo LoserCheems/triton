@@ -760,6 +760,21 @@ getFlowSourceScopeEventIdAndTimeNs(
   return std::make_pair(event.launchScopeEventId, sourceTimeNs);
 }
 
+uint64_t getAdjustedFlowStartTimeNs(
+    uint64_t sourceTimeNs, uint64_t alignedKernelStartTimeNs,
+    const TraceData::Trace::TraceEvent &scopeEvent) {
+  auto latestFlowStartTimeNs =
+      std::min(scopeEvent.cpuEndTimeNs, alignedKernelStartTimeNs);
+  if (latestFlowStartTimeNs > scopeEvent.cpuStartTimeNs) {
+    latestFlowStartTimeNs -= 1;
+  }
+  if (latestFlowStartTimeNs < scopeEvent.cpuStartTimeNs) {
+    return scopeEvent.cpuStartTimeNs;
+  }
+  return std::clamp(sourceTimeNs, scopeEvent.cpuStartTimeNs,
+                    latestFlowStartTimeNs);
+}
+
 void dumpKernelMetricTrace(
     const std::vector<OrderedTraceEvent> &orderedTraceEvents,
     const std::map<size_t, TraceData::Trace::TraceEvent> &events,
@@ -778,10 +793,15 @@ void dumpKernelMetricTrace(
     minTimeStamp =
         std::min(minTimeStamp, getAlignedStartTimeNs(event, kernelClockOffsetNs));
     if (event.kind == OrderedTraceEvent::Kind::Kernel) {
-      auto flowSource =
-          getFlowSourceScopeEventIdAndTimeNs(event, events);
+      const auto alignedStartTimeNs =
+          getAlignedStartTimeNs(event, kernelClockOffsetNs);
+      auto flowSource = getFlowSourceScopeEventIdAndTimeNs(event, events);
       if (flowSource) {
-        minTimeStamp = std::min(minTimeStamp, flowSource->second);
+        const auto &scopeEvent = events.at(flowSource->first);
+        minTimeStamp = std::min(
+            minTimeStamp, getAdjustedFlowStartTimeNs(flowSource->second,
+                                                     alignedStartTimeNs,
+                                                     scopeEvent));
       }
     }
   }
@@ -835,13 +855,15 @@ void dumpKernelMetricTrace(
     }
     const auto [metricScopeEventId, sourceTimeNs] = *flowSource;
     const auto &scopeEvent = events.at(metricScopeEventId);
+    const auto adjustedFlowStartTimeNs =
+        getAdjustedFlowStartTimeNs(sourceTimeNs, alignedStartTimeNs, scopeEvent);
     json flowStart = {{"name", kLaunchFlowName},
                       {"cat", kLaunchFlowCategory},
                       {"ph", "s"},
                       {"bp", "e"},
                       {"id", nextFlowId},
                       {"ts",
-                       static_cast<double>(sourceTimeNs - minTimeStamp) /
+                       static_cast<double>(adjustedFlowStartTimeNs - minTimeStamp) /
                            1000.0},
                       {"tid", getCpuThreadTid(scopeEvent.threadId)}};
     json flowFinish = {{"name", kLaunchFlowName},

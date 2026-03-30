@@ -1013,6 +1013,10 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
     assert is_ts_within_scope(get_flow_start_for_kernel(kernel_2), scope_4)
     assert is_ts_within_scope(get_flow_start_for_kernel(kernel_3), scope_5)
     assert is_ts_within_scope(get_flow_start_for_kernel(kernel_4), scope_7)
+    assert get_flow_start_for_kernel(kernel_1)["ts"] <= kernel_1["ts"]
+    assert get_flow_start_for_kernel(kernel_2)["ts"] <= kernel_2["ts"]
+    assert get_flow_start_for_kernel(kernel_3)["ts"] <= kernel_3["ts"]
+    assert get_flow_start_for_kernel(kernel_4)["ts"] <= kernel_4["ts"]
 
 
 def test_trace_flexible_metrics_no_kernel_anchor(tmp_path: pathlib.Path):

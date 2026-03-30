@@ -929,10 +929,12 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
     trace_events = data["traceEvents"]
     kernel_events = [event for event in trace_events if event["name"] == "foo"]
     metric_events = [event for event in trace_events if event["cat"] == "metric"]
+    scope_events = [event for event in trace_events if event["cat"] == "scope"]
     flow_events = [event for event in trace_events if event["cat"] == "flow"]
 
     assert len(kernel_events) == 4
     assert len(metric_events) == 3
+    assert len(scope_events) == 3
     assert len(flow_events) == 8
     assert all(event["tid"] == "Stream: 7" for event in kernel_events)
     assert [event["cat"] for event in trace_events[:3]] == ["metric", "metric", "metric"]
@@ -952,6 +954,9 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
     metric_1 = get_metric_event("m1")
     metric_2 = get_metric_event("m2")
     metric_3 = get_metric_event("m3")
+    scope_4 = next(event for event in scope_events if event["args"]["call_stack"] == ["ROOT", "scope_3", "scope_2", "scope_4"])
+    scope_5 = next(event for event in scope_events if event["args"]["call_stack"] == ["ROOT", "scope_3", "scope_2", "scope_5"])
+    scope_7 = next(event for event in scope_events if event["args"]["call_stack"] == ["ROOT", "scope_3", "scope_6", "scope_7"])
 
     assert metric_1["cat"] == "metric"
     assert metric_2["cat"] == "metric"
@@ -971,6 +976,12 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
     assert metric_3["ts"] <= metric_2["ts"] <= metric_1["ts"]
     assert metric_1["ts"] + metric_1["dur"] <= metric_2["ts"] + metric_2["dur"]
     assert metric_2["ts"] + metric_2["dur"] <= metric_3["ts"] + metric_3["dur"]
+    assert scope_4["name"] == "scope_4"
+    assert scope_5["name"] == "scope_5"
+    assert scope_7["name"] == "scope_7"
+    assert scope_4["tid"] == metric_1["tid"]
+    assert scope_5["tid"] == metric_1["tid"]
+    assert scope_7["tid"] == metric_1["tid"]
 
     assert not any(key.startswith("launch_scope") for key in kernel_1["args"])
     assert not any(key.startswith("launch_scope") for key in kernel_2["args"])

@@ -289,7 +289,7 @@ parity (0 for even, 1 for odd) of the mbarrier object prior to the “arrive” 
 <div class="highlight-mlir notranslate"><div class="highlight"><pre><span></span>ttag.arrive_barrier %barrier, 2 : !ttg.memdesc&lt;1xi64, #shared, #smem, mutable&gt;
 </pre></div>
 </div>
-<p>Interfaces: <code class="docutils literal notranslate"><span class="pre">InferTypeOpInterface</span></code></p>
+<p>Interfaces: <code class="docutils literal notranslate"><span class="pre">InferTypeOpInterface</span></code>, <code class="docutils literal notranslate"><span class="pre">MBarrierOpInterface</span></code></p>
 <section id="attributes">
 <h3>Attributes:<a class="headerlink" href="#attributes" title="Link to this heading">¶</a></h3>
 <table>
@@ -400,6 +400,7 @@ This allows op to use async_copy_local_to_global even if the alignment cannot be
 <p>Performs the “async arrive” operation by decrementing pending account by 1 when all previous async load to LDS (particularly, not TDM) have completed.
 The instruction itself is asynchronous; it returns immediately. Decrements the barrier pending count. The update value for decrementing is fixed at 1.
 If the pending count becomes zero, the phase changes (is decremented in a wraparound manner) and the pending count is reloaded with the init count value.</p>
+<p>Interfaces: <code class="docutils literal notranslate"><span class="pre">MBarrierOpInterface</span></code></p>
 <section id="id4">
 <h3>Operands:<a class="headerlink" href="#id4" title="Link to this heading">¶</a></h3>
 <table class="docutils align-default">
@@ -433,7 +434,7 @@ swizzling.
 The operation can also take an optional 64bit LDS barrier address, in which case
 it sends an “LDS atomic arrive” to signal its completion.</p>
 <p>Traits: <code class="docutils literal notranslate"><span class="pre">AttrSizedOperandSegments</span></code></p>
-<p>Interfaces: <code class="docutils literal notranslate"><span class="pre">InferTypeOpInterface</span></code></p>
+<p>Interfaces: <code class="docutils literal notranslate"><span class="pre">InferTypeOpInterface</span></code>, <code class="docutils literal notranslate"><span class="pre">MBarrierOpInterface</span></code></p>
 <section id="id5">
 <h3>Operands:<a class="headerlink" href="#id5" title="Link to this heading">¶</a></h3>
 <table class="docutils align-default">
@@ -493,6 +494,7 @@ operation does not support shared memory padding or swizzling.
 The operation can also take an optional 64bit LDS barrier address, in which case
 it sends an “LDS atomic arrive” to signal its completion.</p>
 <p>Traits: <code class="docutils literal notranslate"><span class="pre">AttrSizedOperandSegments</span></code></p>
+<p>Interfaces: <code class="docutils literal notranslate"><span class="pre">MBarrierOpInterface</span></code></p>
 <section id="id7">
 <h3>Operands:<a class="headerlink" href="#id7" title="Link to this heading">¶</a></h3>
 <table class="docutils align-default">
@@ -539,7 +541,7 @@ If more rows are needed, multiple TDM instructions will be issued.</p></li>
 </ul>
 <p>The src_col_offset specifies the starting column in the source tensor for
 all gathered rows.</p>
-<p>Interfaces: <code class="docutils literal notranslate"><span class="pre">InferTypeOpInterface</span></code></p>
+<p>Interfaces: <code class="docutils literal notranslate"><span class="pre">InferTypeOpInterface</span></code>, <code class="docutils literal notranslate"><span class="pre">MBarrierOpInterface</span></code></p>
 <section id="id8">
 <h3>Operands:<a class="headerlink" href="#id8" title="Link to this heading">¶</a></h3>
 <table class="docutils align-default">
@@ -662,7 +664,7 @@ If more rows are needed, multiple TDM instructions will be issued.</p></li>
 </ul>
 <p>The dst_col_offset specifies the starting column in the destination tensor for
 all scattered rows.</p>
-<p>Interfaces: <code class="docutils literal notranslate"><span class="pre">InferTypeOpInterface</span></code></p>
+<p>Interfaces: <code class="docutils literal notranslate"><span class="pre">InferTypeOpInterface</span></code>, <code class="docutils literal notranslate"><span class="pre">MBarrierOpInterface</span></code></p>
 <section id="id13">
 <h3>Operands:<a class="headerlink" href="#id13" title="Link to this heading">¶</a></h3>
 <table class="docutils align-default">
@@ -1479,6 +1481,7 @@ to transpose within each thread after loading from HBM and before writing to sha
 <p>Initializes a shared memory allocation with mbarrier information.
 <code class="docutils literal notranslate"><span class="pre">alloc</span></code> is a descriptor to the shared memory allocation. <code class="docutils literal notranslate"><span class="pre">count</span></code> is the
 number of arrives expected by the barrier.</p>
+<p>Interfaces: <code class="docutils literal notranslate"><span class="pre">MBarrierOpInterface</span></code></p>
 <section id="id43">
 <h3>Attributes:<a class="headerlink" href="#id43" title="Link to this heading">¶</a></h3>
 <table>
@@ -1871,6 +1874,7 @@ However, they are dropped by the hardware in case the virtual address translatio
 </div>
 <p>Blocks the program progress until the mbarrier object in <code class="docutils literal notranslate"><span class="pre">alloc</span></code> completes
 its current phase.</p>
+<p>Interfaces: <code class="docutils literal notranslate"><span class="pre">MBarrierOpInterface</span></code></p>
 <section id="id62">
 <h3>Operands:<a class="headerlink" href="#id62" title="Link to this heading">¶</a></h3>
 <table class="docutils align-default">

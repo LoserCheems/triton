@@ -21,7 +21,7 @@ Example:
 ttag.arrive_barrier %barrier, 2 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
 ```
 
-Interfaces: `InferTypeOpInterface`
+Interfaces: `InferTypeOpInterface`, `MBarrierOpInterface`
 
 #### Attributes:
 
@@ -104,6 +104,8 @@ Performs the "async arrive" operation by decrementing pending account by 1 when 
 The instruction itself is asynchronous; it returns immediately. Decrements the barrier pending count. The update value for decrementing is fixed at 1.
 If the pending count becomes zero, the phase changes (is decremented in a wraparound manner) and the pending count is reloaded with the init count value.
 
+Interfaces: `MBarrierOpInterface`
+
 #### Operands:
 
 | Operand | Description |
@@ -134,7 +136,7 @@ it sends an "LDS atomic arrive" to signal its completion.
 
 Traits: `AttrSizedOperandSegments`
 
-Interfaces: `InferTypeOpInterface`
+Interfaces: `InferTypeOpInterface`, `MBarrierOpInterface`
 
 #### Operands:
 
@@ -175,6 +177,8 @@ it sends an "LDS atomic arrive" to signal its completion.
 
 Traits: `AttrSizedOperandSegments`
 
+Interfaces: `MBarrierOpInterface`
+
 #### Operands:
 
 | Operand | Description |
@@ -211,7 +215,7 @@ If more rows are needed, multiple TDM instructions will be issued.
 The src_col_offset specifies the starting column in the source tensor for
 all gathered rows.
 
-Interfaces: `InferTypeOpInterface`
+Interfaces: `InferTypeOpInterface`, `MBarrierOpInterface`
 
 #### Operands:
 
@@ -302,7 +306,7 @@ If more rows are needed, multiple TDM instructions will be issued.
 The dst_col_offset specifies the starting column in the destination tensor for
 all scattered rows.
 
-Interfaces: `InferTypeOpInterface`
+Interfaces: `InferTypeOpInterface`, `MBarrierOpInterface`
 
 #### Operands:
 
@@ -983,6 +987,8 @@ Initializes a shared memory allocation with mbarrier information.
 `alloc` is a descriptor to the shared memory allocation. `count` is the
 number of arrives expected by the barrier.
 
+Interfaces: `MBarrierOpInterface`
+
 #### Attributes:
 
 <table>
@@ -1303,6 +1309,8 @@ operation ::= `amdg.wait_barrier` $alloc `,` $phase attr-dict `:` qualified(type
 
 Blocks the program progress until the mbarrier object in `alloc` completes
 its current phase.
+
+Interfaces: `MBarrierOpInterface`
 
 #### Operands:
 

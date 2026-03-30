@@ -26,6 +26,8 @@ ttng.arrive_barrier %barrier, 1, %pred : !ttg.memdesc<1xi64, #shared, #smem, mut
 
 Traits: `VerifyMemDescLayoutsTrait`, `VerifyTensorLayoutsTrait`
 
+Interfaces: `MBarrierOpInterface`
+
 #### Attributes:
 
 <table>
@@ -53,6 +55,8 @@ operation ::= `ttng.async_copy_mbarrier_arrive` $barrier attr-dict `:` qualified
 ```
 
 Traits: `VerifyMemDescLayoutsTrait`, `VerifyTensorLayoutsTrait`
+
+Interfaces: `MBarrierOpInterface`
 
 #### Attributes:
 
@@ -102,6 +106,8 @@ The tensor mode is determined by the descriptor type:
 
 
 Traits: `AttrSizedOperandSegments`, `VerifyMemDescLayoutsTrait`, `VerifyTensorLayoutsTrait`
+
+Interfaces: `MBarrierOpInterface`
 
 #### Attributes:
 
@@ -171,6 +177,8 @@ local memory asynchronously.  This is similar to
 async_tma_copy_global_to_local except that each row is indexed independently.
 
 Traits: `VerifyMemDescLayoutsTrait`, `VerifyTensorLayoutsTrait`
+
+Interfaces: `MBarrierOpInterface`
 
 #### Operands:
 
@@ -292,6 +300,8 @@ This signal the barrier that `size` bytes are expected to be copied. The
 associated barrier wait will block until the expected number of bytes are copied.
 
 Traits: `VerifyMemDescLayoutsTrait`, `VerifyTensorLayoutsTrait`
+
+Interfaces: `MBarrierOpInterface`
 
 #### Attributes:
 
@@ -435,6 +445,8 @@ The mbarrier must be 8-byte aligned shared memory.
 
 Traits: `VerifyMemDescLayoutsTrait`, `VerifyTensorLayoutsTrait`
 
+Interfaces: `MBarrierOpInterface`
+
 #### Attributes:
 
 <table>
@@ -562,6 +574,8 @@ This lowers to PTX mbarrier.init.shared::cta.b64.
 
 Traits: `VerifyMemDescLayoutsTrait`, `VerifyTensorLayoutsTrait`
 
+Interfaces: `MBarrierOpInterface`
+
 #### Attributes:
 
 <table>
@@ -593,6 +607,8 @@ spec this has to be done before any reuse of the memory used by mbarrier.
 https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier-inval
 
 Traits: `VerifyMemDescLayoutsTrait`, `VerifyTensorLayoutsTrait`
+
+Interfaces: `MBarrierOpInterface`
 
 #### Operands:
 
@@ -672,6 +688,8 @@ operation on `%barrierB`, even though its commit group is empty.
 
 Traits: `AttrSizedOperandSegments`, `VerifyMemDescLayoutsTrait`, `VerifyTensorLayoutsTrait`
 
+Interfaces: `MBarrierOpInterface`
+
 #### Operands:
 
 | Operand | Description |
@@ -710,7 +728,7 @@ If true, the integer values are treated as unsigned, otherwise they are treated 
 
 Traits: `AttrSizedOperandSegments`, `VerifyMemDescLayoutsTrait`, `VerifyTensorLayoutsTrait`
 
-Interfaces: `DotOpInterface`, `MMAv5OpInterface`, `MemoryEffectOpInterface`
+Interfaces: `DotOpInterface`, `MBarrierOpInterface`, `MMAv5OpInterface`, `MemoryEffectOpInterface`
 
 #### Attributes:
 
@@ -771,7 +789,7 @@ be used to check aliasing and modref on the accumulator memory.
 
 Traits: `AttrSizedOperandSegments`, `VerifyMemDescLayoutsTrait`, `VerifyTensorLayoutsTrait`
 
-Interfaces: `DotOpInterface`, `MMAv5OpInterface`, `MemoryEffectOpInterface`
+Interfaces: `DotOpInterface`, `MBarrierOpInterface`, `MMAv5OpInterface`, `MemoryEffectOpInterface`
 
 #### Attributes:
 
@@ -966,6 +984,8 @@ In the absence of such operations on memdesc, we resort to implicitly encoding t
 
 Traits: `VerifyMemDescLayoutsTrait`, `VerifyTensorLayoutsTrait`
 
+Interfaces: `MBarrierOpInterface`
+
 #### Operands:
 
 | Operand | Description |
@@ -1158,6 +1178,8 @@ The barrier behavior is described here:
 https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-asynchronous-copy-completion-mechanisms
 
 Traits: `AttrSizedOperandSegments`, `VerifyMemDescLayoutsTrait`, `VerifyTensorLayoutsTrait`
+
+Interfaces: `MBarrierOpInterface`
 
 #### Operands:
 

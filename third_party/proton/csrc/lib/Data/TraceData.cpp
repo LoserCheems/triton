@@ -607,6 +607,24 @@ bool isContextPrefix(const std::vector<Context> &prefix,
   return true;
 }
 
+std::vector<Context>
+normalizeKernelContextsForLaunchScope(const std::vector<Context> &contexts,
+                                      const std::vector<Context> &scopeContexts) {
+  size_t commonPrefixSize = 0;
+  const auto maxCommonPrefixSize =
+      std::min(contexts.size(), scopeContexts.size());
+  while (commonPrefixSize < maxCommonPrefixSize &&
+         contexts[commonPrefixSize].name == scopeContexts[commonPrefixSize].name) {
+    ++commonPrefixSize;
+  }
+
+  std::vector<Context> normalizedContexts = scopeContexts;
+  normalizedContexts.insert(normalizedContexts.end(),
+                            contexts.begin() + commonPrefixSize,
+                            contexts.end());
+  return normalizedContexts;
+}
+
 size_t resolveLaunchScopeEventId(
     size_t owningEventId, const std::vector<Context> &kernelContexts,
     const std::map<size_t, TraceData::Trace::TraceEvent> &events,
@@ -820,6 +838,7 @@ void dumpKernelMetricTrace(
     json flowStart = {{"name", kLaunchFlowName},
                       {"cat", kLaunchFlowCategory},
                       {"ph", "s"},
+                      {"bp", "e"},
                       {"id", nextFlowId},
                       {"ts",
                        static_cast<double>(sourceTimeNs - minTimeStamp) /
@@ -912,14 +931,23 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
             const auto launchScopeEventId =
                 resolveLaunchScopeEventId(owningEventId, contexts, events,
                                           eventIdToContexts);
+            auto kernelContexts = contexts;
+            if (launchScopeEventId != TraceData::Trace::TraceEvent::DummyId) {
+              auto launchScopeContextsIt =
+                  eventIdToContexts.find(launchScopeEventId);
+              if (launchScopeContextsIt != eventIdToContexts.end()) {
+                kernelContexts = normalizeKernelContextsForLaunchScope(
+                    contexts, launchScopeContextsIt->second);
+              }
+            }
             if (isMetricKernel) {
               orderedTraceEvents.push_back(OrderedTraceEvent::kernel(
-                  kernelMetric, flexibleMetrics, contexts, owningEventId,
+                  kernelMetric, flexibleMetrics, kernelContexts, owningEventId,
                   streamId,
                   launchScopeEventId));
             } else {
               orderedTraceEvents.push_back(OrderedTraceEvent::kernel(
-                  kernelMetric, nullptr, contexts, owningEventId, streamId,
+                  kernelMetric, nullptr, kernelContexts, owningEventId, streamId,
                   launchScopeEventId));
             }
             hasKernelMetrics = true;

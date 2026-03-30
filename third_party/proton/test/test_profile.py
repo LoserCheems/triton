@@ -999,6 +999,7 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
     assert all(event["name"] == "launch->kernel" for event in flow_events)
     assert all(event["tid"].startswith("cpu thread ") for event in flow_starts)
     assert all(event["tid"] == "Stream: 7" for event in flow_finishes)
+    assert all(event["bp"] == "e" for event in flow_starts)
     assert all(event["bp"] == "e" for event in flow_finishes)
 
     def get_flow_start_for_kernel(kernel_event):

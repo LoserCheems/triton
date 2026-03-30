@@ -934,7 +934,7 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
 
     assert len(kernel_events) == 4
     assert len(metric_events) == 3
-    assert len(scope_events) == 3
+    assert len(scope_events) == 4
     assert len(flow_events) == 8
     assert all(event["tid"] == "Stream: 7" for event in kernel_events)
     assert [event["cat"] for event in trace_events[:3]] == ["metric", "metric", "metric"]
@@ -956,6 +956,7 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
     metric_3 = get_metric_event("m3")
     scope_4 = next(event for event in scope_events if event["args"]["call_stack"] == ["ROOT", "scope_3", "scope_2", "scope_4"])
     scope_5 = next(event for event in scope_events if event["args"]["call_stack"] == ["ROOT", "scope_3", "scope_2", "scope_5"])
+    scope_6 = next(event for event in scope_events if event["args"]["call_stack"] == ["ROOT", "scope_3", "scope_6"])
     scope_7 = next(event for event in scope_events if event["args"]["call_stack"] == ["ROOT", "scope_3", "scope_6", "scope_7"])
 
     assert metric_1["cat"] == "metric"
@@ -978,9 +979,11 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
     assert metric_2["ts"] + metric_2["dur"] <= metric_3["ts"] + metric_3["dur"]
     assert scope_4["name"] == "scope_4"
     assert scope_5["name"] == "scope_5"
+    assert scope_6["name"] == "scope_6"
     assert scope_7["name"] == "scope_7"
     assert scope_4["tid"] == metric_1["tid"]
     assert scope_5["tid"] == metric_1["tid"]
+    assert scope_6["tid"] == metric_1["tid"]
     assert scope_7["tid"] == metric_1["tid"]
 
     assert not any(key.startswith("launch_scope") for key in kernel_1["args"])
@@ -997,6 +1000,18 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
     assert all(event["tid"].startswith("cpu thread ") for event in flow_starts)
     assert all(event["tid"] == "Stream: 7" for event in flow_finishes)
     assert all(event["bp"] == "e" for event in flow_finishes)
+
+    def get_flow_start_for_kernel(kernel_event):
+        flow_finish = next(event for event in flow_finishes if event["ts"] == kernel_event["ts"])
+        return next(event for event in flow_starts if event["id"] == flow_finish["id"])
+
+    def is_ts_within_scope(flow_start, scope_event):
+        return scope_event["ts"] <= flow_start["ts"] <= scope_event["ts"] + scope_event["dur"]
+
+    assert is_ts_within_scope(get_flow_start_for_kernel(kernel_1), metric_1)
+    assert is_ts_within_scope(get_flow_start_for_kernel(kernel_2), scope_4)
+    assert is_ts_within_scope(get_flow_start_for_kernel(kernel_3), scope_5)
+    assert is_ts_within_scope(get_flow_start_for_kernel(kernel_4), scope_7)
 
 
 def test_trace_flexible_metrics_no_kernel_anchor(tmp_path: pathlib.Path):

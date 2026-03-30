@@ -399,16 +399,17 @@ std::string buildFlexibleMetricEventName(
   auto appendTuple =
       [&](std::ostringstream &os, const std::string &metricName,
           const FlexibleMetric &metricValue) {
-        os << "(" << scopeName << ", " << metricName << ", "
-           << formatFlexibleMetricValue(metricValue.getValues()[0]) << ")";
+        os << "<" << metricName << ", "
+           << formatFlexibleMetricValue(metricValue.getValues()[0]) << ">";
       };
   std::ostringstream os;
   if (flexibleMetrics.size() == 1) {
+    os << scopeName << ": ";
     const auto &[metricName, metricValue] = *flexibleMetrics.begin();
     appendTuple(os, metricName, metricValue);
     return os.str();
   }
-  os << "[";
+  os << scopeName << ": ";
   bool isFirst = true;
   for (const auto &[metricName, metricValue] : flexibleMetrics) {
     if (!isFirst) {
@@ -417,7 +418,6 @@ std::string buildFlexibleMetricEventName(
     appendTuple(os, metricName, metricValue);
     isFirst = false;
   }
-  os << "]";
   return os.str();
 }
 
@@ -611,22 +611,6 @@ size_t findNearestMetricScopeEventId(
   return TraceData::Trace::TraceEvent::DummyId;
 }
 
-void appendLaunchScopeArgs(
-    json &args, size_t launchScopeEventId,
-    const std::map<size_t, TraceData::Trace::TraceEvent> &events,
-    const std::unordered_map<size_t, std::vector<Context>> &eventIdToContexts) {
-  const auto metricScopeEventId =
-      findNearestMetricScopeEventId(launchScopeEventId, events);
-  if (metricScopeEventId == TraceData::Trace::TraceEvent::DummyId) {
-    return;
-  }
-  const auto &scopeEvent = events.at(metricScopeEventId);
-  args["launch_scope_event_id"] = metricScopeEventId;
-  args["launch_scope_thread_id"] = scopeEvent.threadId;
-  args["launch_scope_metrics"] =
-      buildFlexibleMetricsJson(scopeEvent.metricSet.flexibleMetrics);
-}
-
 std::optional<int64_t> computeKernelClockOffsetNs(
     const std::vector<OrderedTraceEvent> &orderedTraceEvents,
     const std::map<size_t, TraceData::Trace::TraceEvent> &events) {
@@ -665,6 +649,10 @@ std::string getCpuThreadTid(uint64_t threadId) {
   return std::string(kCpuThreadTidPrefix) + std::to_string(threadId);
 }
 
+std::string getStreamTid(size_t streamId) {
+  return "Stream: " + std::to_string(streamId);
+}
+
 std::optional<std::pair<size_t, uint64_t>>
 getFlowSourceScopeEventIdAndTimeNs(
     const OrderedTraceEvent &event,
@@ -690,7 +678,6 @@ getFlowSourceScopeEventIdAndTimeNs(
 void dumpKernelMetricTrace(
     const std::vector<OrderedTraceEvent> &orderedTraceEvents,
     const std::map<size_t, TraceData::Trace::TraceEvent> &events,
-    const std::unordered_map<size_t, std::vector<Context>> &eventIdToContexts,
     std::ostream &os) {
   json object = {{"displayTimeUnit", "us"}, {"traceEvents", json::array()}};
   const bool hasCpuMetricScopes = std::any_of(
@@ -714,10 +701,10 @@ void dumpKernelMetricTrace(
     }
   }
   uint64_t nextFlowId = 0;
-  for (const auto &event : orderedTraceEvents) {
+  auto appendTraceEvent = [&](const OrderedTraceEvent &event) {
     if (event.kind == OrderedTraceEvent::Kind::CpuMetricScope &&
         !event.flexibleMetrics) {
-      continue;
+      return;
     }
 
     json element;
@@ -728,15 +715,12 @@ void dumpKernelMetricTrace(
         element["name"] = event.contexts.back().name;
       }
       element["cat"] = "kernel";
-      element["tid"] = event.streamId;
-      appendLaunchScopeArgs(element["args"], event.launchScopeEventId, events,
-                            eventIdToContexts);
+      element["tid"] = getStreamTid(event.streamId);
     } else {
       element["name"] =
           buildFlexibleMetricEventName(event.contexts, *event.flexibleMetrics);
       element["cat"] = "metric";
-      element["tid"] =
-          std::string(kCpuThreadTidPrefix) + std::to_string(event.threadId);
+      element["tid"] = getCpuThreadTid(event.threadId);
       element["args"]["thread_id"] = event.threadId;
     }
     const auto alignedStartTimeNs =
@@ -753,12 +737,12 @@ void dumpKernelMetricTrace(
     }
     object["traceEvents"].push_back(element);
     if (event.kind != OrderedTraceEvent::Kind::Kernel) {
-      continue;
+      return;
     }
     const auto flowSource =
         getFlowSourceScopeEventIdAndTimeNs(event, events);
     if (!flowSource) {
-      continue;
+      return;
     }
     const auto [metricScopeEventId, sourceTimeNs] = *flowSource;
     const auto &scopeEvent = events.at(metricScopeEventId);
@@ -778,10 +762,21 @@ void dumpKernelMetricTrace(
                        {"ts",
                         static_cast<double>(alignedStartTimeNs - minTimeStamp) /
                             1000.0},
-                       {"tid", event.streamId}};
+                       {"tid", getStreamTid(event.streamId)}};
     object["traceEvents"].push_back(flowStart);
     object["traceEvents"].push_back(flowFinish);
     ++nextFlowId;
+  };
+
+  for (const auto &event : orderedTraceEvents) {
+    if (event.kind == OrderedTraceEvent::Kind::CpuMetricScope) {
+      appendTraceEvent(event);
+    }
+  }
+  for (const auto &event : orderedTraceEvents) {
+    if (event.kind == OrderedTraceEvent::Kind::Kernel) {
+      appendTraceEvent(event);
+    }
   }
 
   os << object.dump() << "\n";
@@ -911,7 +906,7 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
     }
 
     if (hasKernelMetrics || hasCpuMetricScopes) {
-      dumpKernelMetricTrace(orderedTraceEvents, events, eventIdToContexts, os);
+      dumpKernelMetricTrace(orderedTraceEvents, events, os);
     } else {
       os << json({{"displayTimeUnit", "us"}, {"traceEvents", json::array()}})
                 .dump()

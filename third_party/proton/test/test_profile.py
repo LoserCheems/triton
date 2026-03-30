@@ -934,6 +934,8 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
     assert len(kernel_events) == 4
     assert len(metric_events) == 3
     assert len(flow_events) == 8
+    assert all(event["tid"] == "Stream: 7" for event in kernel_events)
+    assert [event["cat"] for event in trace_events[:3]] == ["metric", "metric", "metric"]
 
     def get_kernel_event(*scope_names: str):
         expected_stack = ["ROOT", *scope_names, "foo"]
@@ -960,9 +962,9 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
     assert metric_1["args"]["call_stack"] == ["ROOT", "scope_3", "scope_2", "scope_1"]
     assert metric_2["args"]["call_stack"] == ["ROOT", "scope_3", "scope_2"]
     assert metric_3["args"]["call_stack"] == ["ROOT", "scope_3"]
-    assert metric_1["name"] == "(scope_1, m1, 1.000000)"
-    assert metric_2["name"] == "(scope_2, m2, 2.000000)"
-    assert metric_3["name"] == "(scope_3, m3, 3.000000)"
+    assert metric_1["name"] == "scope_1: <m1, 1.000000>"
+    assert metric_2["name"] == "scope_2: <m2, 2.000000>"
+    assert metric_3["name"] == "scope_3: <m3, 3.000000>"
     assert metric_1["args"]["metrics"]["m1"] == "1.000000"
     assert metric_2["args"]["metrics"]["m2"] == "2.000000"
     assert metric_3["args"]["metrics"]["m3"] == "3.000000"
@@ -970,12 +972,9 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
     assert metric_1["ts"] + metric_1["dur"] <= metric_2["ts"] + metric_2["dur"]
     assert metric_2["ts"] + metric_2["dur"] <= metric_3["ts"] + metric_3["dur"]
 
-    assert "launch_scope_call_stack" not in kernel_1["args"]
-    assert kernel_1["args"]["launch_scope_metrics"] == {"m1": "1.000000"}
-    assert "launch_scope_call_stack" not in kernel_2["args"]
-    assert kernel_2["args"]["launch_scope_metrics"] == {"m2": "2.000000"}
-    assert "launch_scope_call_stack" not in kernel_4["args"]
-    assert kernel_4["args"]["launch_scope_metrics"] == {"m3": "3.000000"}
+    assert not any(key.startswith("launch_scope") for key in kernel_1["args"])
+    assert not any(key.startswith("launch_scope") for key in kernel_2["args"])
+    assert not any(key.startswith("launch_scope") for key in kernel_4["args"])
 
     flow_starts = [event for event in flow_events if event["ph"] == "s"]
     flow_finishes = [event for event in flow_events if event["ph"] == "f"]
@@ -985,7 +984,7 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
     assert len({event["id"] for event in flow_starts}) == 4
     assert all(event["name"] == "launch->kernel" for event in flow_events)
     assert all(event["tid"].startswith("cpu thread ") for event in flow_starts)
-    assert all(event["tid"] == 7 for event in flow_finishes)
+    assert all(event["tid"] == "Stream: 7" for event in flow_finishes)
     assert all(event["bp"] == "e" for event in flow_finishes)
 
 
@@ -1003,7 +1002,7 @@ def test_trace_flexible_metrics_no_kernel_anchor(tmp_path: pathlib.Path):
 
     assert len(data["traceEvents"]) == 1
     metric_event = data["traceEvents"][0]
-    assert metric_event["name"] == "(metric_only, foo, 1.000000)"
+    assert metric_event["name"] == "metric_only: <foo, 1.000000>"
     assert metric_event["cat"] == "metric"
     assert metric_event["tid"].startswith("cpu thread ")
     assert metric_event["args"]["call_stack"] == ["ROOT", "metric_only"]

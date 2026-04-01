@@ -461,13 +461,7 @@ static Attribute inferSrcEncoding(triton::TransposeOpInterface op,
 
 static Attribute inferReshapeOpDstEncoding(ArrayRef<int64_t> srcShape,
                                            Attribute srcEnc,
-                                           ArrayRef<int64_t> dstShape,
-                                           bool allowReorder) {
-  // We don't do anything smart to allow-reorder reshapes here.  They are
-  // handled in OptimizeThreadLocality.
-  if (allowReorder)
-    return {};
-
+                                           ArrayRef<int64_t> dstShape) {
   Attribute dstEnc;
   auto result =
       srcEnc.getDialect()
@@ -480,8 +474,7 @@ static Attribute inferReshapeOpDstEncoding(ArrayRef<int64_t> srcShape,
 
 static Attribute inferDstEncoding(triton::ReshapeOp op, Attribute encoding) {
   return inferReshapeOpDstEncoding(op.getSrc().getType().getShape(), encoding,
-                                   op.getType().getShape(),
-                                   op.getAllowReorder());
+                                   op.getType().getShape());
 }
 
 static Attribute inferDstEncoding(GatherOp op, Attribute encoding) {
@@ -497,8 +490,7 @@ static Attribute inferSrcEncoding(triton::ReshapeOp op, Attribute encoding) {
   // invariant of inferReshapeOpNoReorderEncoding that it's symmetric in this
   // way.
   return inferReshapeOpDstEncoding(op.getType().getShape(), encoding,
-                                   op.getSrc().getType().getShape(),
-                                   op.getAllowReorder());
+                                   op.getSrc().getType().getShape());
 }
 
 static bool isSingleValue(Value value) {

@@ -296,6 +296,7 @@ struct CycleMetricWithContext {
 constexpr const char *kCpuThreadTidPrefix = "cpu thread ";
 constexpr const char *kLaunchFlowName = "launch->kernel";
 constexpr const char *kLaunchFlowCategory = "flow";
+constexpr const char *kComputeMetadataScopeName = "__proton_launch_metadata";
 
 struct OrderedTraceEvent {
   enum class Kind { Kernel, CpuScope, GraphScope };
@@ -313,6 +314,7 @@ struct OrderedTraceEvent {
   uint64_t endTimeNs = 0;
   bool isGraphLinked = false;
   bool isMetricKernel = false;
+  size_t graphScopeStartIndex = 0;
   bool hasGraphFlowSource = false;
   uint64_t graphFlowStartTimeNs = 0;
   uint64_t graphFlowEndTimeNs = 0;
@@ -328,7 +330,8 @@ struct OrderedTraceEvent {
                                   std::vector<Context> contexts,
                                   size_t owningEventId, size_t streamId,
                                   size_t launchScopeEventId,
-                                  bool isGraphLinked, bool isMetricKernel) {
+                                  bool isGraphLinked, bool isMetricKernel,
+                                  size_t graphScopeStartIndex) {
     OrderedTraceEvent event;
     event.kind = Kind::Kernel;
     event.kernelMetric = metric;
@@ -343,6 +346,7 @@ struct OrderedTraceEvent {
         std::get<uint64_t>(metric->getValue(KernelMetric::EndTime));
     event.isGraphLinked = isGraphLinked;
     event.isMetricKernel = isMetricKernel;
+    event.graphScopeStartIndex = graphScopeStartIndex;
     return event;
   }
 
@@ -386,6 +390,7 @@ struct GraphKernelRecord {
   size_t streamId{};
   uint64_t startTimeNs{};
   uint64_t endTimeNs{};
+  size_t scopeStartIndex{};
   std::vector<Context> scopeContexts;
   const DataEntry::FlexibleMetricMap *flexibleMetrics{};
 };
@@ -671,38 +676,42 @@ bool isContextPrefix(const std::vector<Context> &prefix,
   return true;
 }
 
-std::optional<size_t>
-findContextIndexByName(const std::vector<Context> &contexts,
-                       const std::string &name) {
-  for (size_t i = 0; i < contexts.size(); ++i) {
-    if (contexts[i].name == name) {
-      return i;
+bool isHiddenGraphTraceContext(const Context &context) {
+  return context.name == GraphState::captureTag ||
+         context.name == kComputeMetadataScopeName;
+}
+
+std::vector<Context>
+normalizeGraphKernelContextsForTrace(const std::vector<Context> &contexts) {
+  std::vector<Context> normalizedContexts;
+  normalizedContexts.reserve(contexts.size());
+  for (const auto &context : contexts) {
+    if (!isHiddenGraphTraceContext(context)) {
+      normalizedContexts.push_back(context);
     }
   }
-  return std::nullopt;
+  return normalizedContexts;
 }
 
 std::vector<Context> getGraphScopeContexts(const OrderedTraceEvent &event) {
-  if (!event.isGraphLinked || event.contexts.empty()) {
+  if (!event.isGraphLinked || event.contexts.size() <= event.graphScopeStartIndex) {
     return {};
   }
-  auto captureIndex = findContextIndexByName(event.contexts, GraphState::captureTag);
-  if (!captureIndex || *captureIndex >= event.contexts.size() - 1) {
+  if (event.contexts.size() <= event.graphScopeStartIndex + 1) {
     return {};
   }
   return std::vector<Context>(event.contexts.begin(), event.contexts.end() - 1);
 }
 
 std::vector<std::vector<Context>>
-buildGraphScopePrefixes(const std::vector<Context> &scopeContexts) {
+buildGraphScopePrefixes(const std::vector<Context> &scopeContexts,
+                        size_t scopeStartIndex) {
   std::vector<std::vector<Context>> prefixes;
-  auto captureIndex =
-      findContextIndexByName(scopeContexts, GraphState::captureTag);
-  if (!captureIndex) {
+  if (scopeStartIndex >= scopeContexts.size()) {
     return prefixes;
   }
-  prefixes.reserve(scopeContexts.size() - *captureIndex);
-  for (size_t i = *captureIndex; i < scopeContexts.size(); ++i) {
+  prefixes.reserve(scopeContexts.size() - scopeStartIndex);
+  for (size_t i = scopeStartIndex; i < scopeContexts.size(); ++i) {
     prefixes.emplace_back(scopeContexts.begin(), scopeContexts.begin() + i + 1);
   }
   return prefixes;
@@ -948,7 +957,8 @@ void reconstructGraphScopeEvents(
     }
     auto record =
         GraphKernelRecord{i, event.owningEventId, event.streamId, event.startTimeNs,
-                          event.endTimeNs, std::move(scopeContexts),
+                          event.endTimeNs, event.graphScopeStartIndex,
+                          std::move(scopeContexts),
                           event.getFlexibleMetrics()};
     groupToGraphKernels[{event.owningEventId, event.streamId}].push_back(record);
     auto firstGraphKernelIt = owningEventIdToFirstGraphKernel.find(event.owningEventId);
@@ -1010,7 +1020,8 @@ void reconstructGraphScopeEvents(
     bool hasPreviousRange = false;
 
     for (const auto &record : graphKernelRecords) {
-      auto scopePrefixes = buildGraphScopePrefixes(record.scopeContexts);
+      auto scopePrefixes =
+          buildGraphScopePrefixes(record.scopeContexts, record.scopeStartIndex);
       if (scopePrefixes.empty()) {
         continue;
       }
@@ -1331,23 +1342,29 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
                 resolveLaunchScopeEventId(owningEventId, contexts, events,
                                           eventIdToContexts);
             auto kernelContexts = contexts;
+            size_t graphScopeStartIndex = 0;
             if (launchScopeEventId != TraceData::Trace::TraceEvent::DummyId) {
               auto launchScopeContextsIt =
                   eventIdToContexts.find(launchScopeEventId);
               if (launchScopeContextsIt != eventIdToContexts.end()) {
+                graphScopeStartIndex = launchScopeContextsIt->second.size();
                 kernelContexts = normalizeKernelContextsForLaunchScope(
                     contexts, launchScopeContextsIt->second);
               }
+            }
+            if (isGraphLinked) {
+              kernelContexts = normalizeGraphKernelContextsForTrace(kernelContexts);
             }
             if (isMetricKernel) {
               orderedTraceEvents.push_back(OrderedTraceEvent::kernel(
                   kernelMetric, flexibleMetrics, kernelContexts, owningEventId,
                   streamId, launchScopeEventId, isGraphLinked,
-                  isMetricKernel));
+                  isMetricKernel, graphScopeStartIndex));
             } else {
               orderedTraceEvents.push_back(OrderedTraceEvent::kernel(
                   kernelMetric, nullptr, kernelContexts, owningEventId, streamId,
-                  launchScopeEventId, isGraphLinked, isMetricKernel));
+                  launchScopeEventId, isGraphLinked, isMetricKernel,
+                  graphScopeStartIndex));
             }
             hasKernelMetrics = true;
             emittedKernel = true;

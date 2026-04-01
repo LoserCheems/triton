@@ -1095,26 +1095,22 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
     assert replay_graph_events
     graph_tid = replay_graph_events[0]["tid"]
     assert all(event["tid"] == graph_tid for event in replay_graph_events)
+    assert all("<captured_at>" not in get_call_stack(event) for event in replay_graph_events)
+    assert all(COMPUTE_METADATA_SCOPE_NAME not in get_call_stack(event) for event in replay_graph_events)
 
-    capture_event = next(
-        event for event in replay_graph_events
-        if has_stack(event, ["ROOT", "test0", "<captured_at>"])
-    )
     scope_a = next(
         event for event in replay_graph_events
-        if has_stack(event, ["ROOT", "test0", "<captured_at>", "a"])
+        if has_stack(event, ["ROOT", "test0", "a"])
     )
     scope_b = next(
         event for event in replay_graph_events
-        if has_stack(event, ["ROOT", "test0", "<captured_at>", "a", "b"])
+        if has_stack(event, ["ROOT", "test0", "a", "b"])
     )
     scope_c = next(
         event for event in replay_graph_events
-        if has_stack(event, ["ROOT", "test0", "<captured_at>", "a", "b", "c"])
+        if has_stack(event, ["ROOT", "test0", "a", "b", "c"])
     )
 
-    assert capture_event["name"] == "<captured_at>"
-    assert capture_event["cat"] == "scope"
     assert scope_a["name"] == "a"
     assert scope_a["cat"] == "scope"
     assert scope_b["name"] == "b"
@@ -1123,16 +1119,16 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
     assert scope_c["cat"] == "metric"
     assert scope_c["args"]["metrics"] == {"m1": "1.000000"}
 
-    assert capture_event["ts"] <= scope_a["ts"] <= scope_b["ts"] <= scope_c["ts"]
+    assert scope_a["ts"] <= scope_b["ts"] <= scope_c["ts"]
     assert scope_c["ts"] + scope_c["dur"] <= scope_b["ts"] + scope_b["dur"]
     assert scope_b["ts"] + scope_b["dur"] <= scope_a["ts"] + scope_a["dur"]
-    assert scope_a["ts"] + scope_a["dur"] <= capture_event["ts"] + capture_event["dur"]
 
     replay_kernel_events = [
         event for event in trace_events
         if event["cat"] == "kernel" and "test0" in get_call_stack(event)
-        and "<captured_at>" in get_call_stack(event)
     ]
+    assert all("<captured_at>" not in get_call_stack(event) for event in replay_kernel_events)
+    assert all(COMPUTE_METADATA_SCOPE_NAME not in get_call_stack(event) for event in replay_kernel_events)
     foo_events = [event for event in replay_kernel_events if event["name"] == "foo"]
     metric_kernel_events = [event for event in replay_kernel_events if event["name"] == "<metric>"]
 
@@ -1140,7 +1136,7 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
     assert len(metric_kernel_events) == 1
     metric_kernel_event = metric_kernel_events[0]
     assert metric_kernel_event["args"]["call_stack"] == [
-        "ROOT", "test0", "<captured_at>", "a", "b", "c", "<metric>"
+        "ROOT", "test0", "a", "b", "c", "<metric>"
     ]
 
     flow_starts = [event for event in trace_events if event["cat"] == "flow" and event["ph"] == "s"]
@@ -1155,15 +1151,15 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
 
     kernel_abc = next(
         event for event in foo_events
-        if event["args"]["call_stack"] == ["ROOT", "test0", "<captured_at>", "a", "b", "c", "foo"]
+        if event["args"]["call_stack"] == ["ROOT", "test0", "a", "b", "c", "foo"]
     )
     kernel_ab = next(
         event for event in foo_events
-        if event["args"]["call_stack"] == ["ROOT", "test0", "<captured_at>", "a", "b", "foo"]
+        if event["args"]["call_stack"] == ["ROOT", "test0", "a", "b", "foo"]
     )
     kernel_a = next(
         event for event in foo_events
-        if event["args"]["call_stack"] == ["ROOT", "test0", "<captured_at>", "a", "foo"]
+        if event["args"]["call_stack"] == ["ROOT", "test0", "a", "foo"]
     )
 
     for kernel_event, scope_event in [
@@ -1217,21 +1213,18 @@ def test_trace_cudagraph_metric_only_scope_path(tmp_path: pathlib.Path, device: 
     ]
     assert replay_graph_events
     graph_tid = replay_graph_events[0]["tid"]
+    assert all("<captured_at>" not in get_call_stack(event) for event in replay_graph_events)
+    assert all(COMPUTE_METADATA_SCOPE_NAME not in get_call_stack(event) for event in replay_graph_events)
 
-    capture_event = next(
-        event for event in replay_graph_events
-        if has_stack(event, ["ROOT", "test0", "<captured_at>"])
-    )
     outer_event = next(
         event for event in replay_graph_events
-        if has_stack(event, ["ROOT", "test0", "<captured_at>", "outer"])
+        if has_stack(event, ["ROOT", "test0", "outer"])
     )
     inner_event = next(
         event for event in replay_graph_events
-        if has_stack(event, ["ROOT", "test0", "<captured_at>", "outer", "inner"])
+        if has_stack(event, ["ROOT", "test0", "outer", "inner"])
     )
 
-    assert capture_event["cat"] == "scope"
     assert outer_event["cat"] == "scope"
     assert inner_event["name"] == "inner: <metric_only, 2.000000>"
     assert inner_event["cat"] == "metric"
@@ -1242,7 +1235,7 @@ def test_trace_cudagraph_metric_only_scope_path(tmp_path: pathlib.Path, device: 
         if event["cat"] == "kernel"
         and event["name"] == "<metric>"
         and get_call_stack(event) == [
-            "ROOT", "test0", "<captured_at>", "outer", "inner", "<metric>"
+            "ROOT", "test0", "outer", "inner", "<metric>"
         ]
     ]
     assert len(replay_metric_kernels) == 1

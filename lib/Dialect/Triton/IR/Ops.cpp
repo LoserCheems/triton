@@ -10,6 +10,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -912,7 +913,14 @@ LogicalResult ReshapeOp::verify() {
                      "encodings, or (b) neither does.");
   }
 
-  if (!srcEnc || getAllowReorder()) {
+  if (!srcEnc) {
+    return success();
+  }
+  if (getAllowReorder()) {
+    // Since reordering is allowed, the layouts don't have to match exactly, but
+    // they still shouldn't produce any data movement.
+    if (gpu::isExpensiveView(srcTy, dstTy))
+      return emitError("Reshape must be free.");
     return success();
   }
 

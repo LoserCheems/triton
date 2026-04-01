@@ -1068,8 +1068,6 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
     temp_file = tmp_path / "test_trace_cudagraph_graph_scope_ranges.chrome_trace"
     proton.start(str(temp_file.with_suffix("")), data="trace", context="shadow")
 
-    fn()
-
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         fn()
@@ -1192,8 +1190,6 @@ def test_trace_cudagraph_metric_only_scope_path(tmp_path: pathlib.Path, device: 
 
     temp_file = tmp_path / "test_trace_cudagraph_metric_only_scope_path.chrome_trace"
     proton.start(str(temp_file.with_suffix("")), data="trace", context="shadow")
-
-    fn()
 
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):

@@ -316,6 +316,7 @@ struct OrderedTraceEvent {
   bool hasGraphFlowSource = false;
   uint64_t graphFlowStartTimeNs = 0;
   uint64_t graphFlowEndTimeNs = 0;
+  std::optional<int64_t> explicitClockOffsetNs;
 
   const DataEntry::FlexibleMetricMap *getFlexibleMetrics() const {
     return flexibleMetricsStorage ? flexibleMetricsStorage.get()
@@ -362,7 +363,8 @@ struct OrderedTraceEvent {
       std::vector<Context> contexts, size_t streamId, uint64_t startTimeNs,
       uint64_t endTimeNs,
       std::shared_ptr<DataEntry::FlexibleMetricMap> flexibleMetricsStorage =
-          nullptr) {
+          nullptr,
+      std::optional<int64_t> explicitClockOffsetNs = std::nullopt) {
     OrderedTraceEvent event;
     event.kind = Kind::GraphScope;
     event.contexts = std::move(contexts);
@@ -370,6 +372,7 @@ struct OrderedTraceEvent {
     event.startTimeNs = startTimeNs;
     event.endTimeNs = endTimeNs;
     event.flexibleMetricsStorage = std::move(flexibleMetricsStorage);
+    event.explicitClockOffsetNs = explicitClockOffsetNs;
     event.flexibleMetrics = event.flexibleMetricsStorage
                                 ? event.flexibleMetricsStorage.get()
                                 : nullptr;
@@ -848,15 +851,31 @@ std::optional<int64_t> computeKernelClockOffsetNs(
   return *middle;
 }
 
+uint64_t getAlignedTimestampNs(uint64_t timeNs,
+                               const std::optional<int64_t> &clockOffsetNs) {
+  if (!clockOffsetNs) {
+    return timeNs;
+  }
+  const auto alignedTimeNs = static_cast<int64_t>(timeNs) + *clockOffsetNs;
+  return alignedTimeNs < 0 ? 0 : static_cast<uint64_t>(alignedTimeNs);
+}
+
+std::optional<int64_t>
+getClockOffsetNs(const OrderedTraceEvent &event,
+                 const std::optional<int64_t> &kernelClockOffsetNs) {
+  if (event.explicitClockOffsetNs) {
+    return event.explicitClockOffsetNs;
+  }
+  if (event.kind == OrderedTraceEvent::Kind::Kernel) {
+    return kernelClockOffsetNs;
+  }
+  return std::nullopt;
+}
+
 uint64_t getAlignedStartTimeNs(const OrderedTraceEvent &event,
                                const std::optional<int64_t> &kernelClockOffsetNs) {
-  if (event.kind != OrderedTraceEvent::Kind::Kernel || event.isGraphLinked ||
-      !kernelClockOffsetNs) {
-    return event.startTimeNs;
-  }
-  const auto alignedStart =
-      static_cast<int64_t>(event.startTimeNs) + *kernelClockOffsetNs;
-  return alignedStart < 0 ? 0 : static_cast<uint64_t>(alignedStart);
+  return getAlignedTimestampNs(event.startTimeNs,
+                               getClockOffsetNs(event, kernelClockOffsetNs));
 }
 
 std::string getCpuThreadTid(uint64_t threadId) {
@@ -912,9 +931,12 @@ uint64_t getAdjustedFlowStartTimeNs(
                     latestFlowStartTimeNs);
 }
 
-void reconstructGraphScopeEvents(std::vector<OrderedTraceEvent> &orderedTraceEvents) {
+void reconstructGraphScopeEvents(
+    std::vector<OrderedTraceEvent> &orderedTraceEvents,
+    const std::map<size_t, TraceData::Trace::TraceEvent> &events) {
   using GroupKey = std::pair<size_t, size_t>;
   std::map<GroupKey, std::vector<GraphKernelRecord>> groupToGraphKernels;
+  std::map<size_t, GraphKernelRecord> owningEventIdToFirstGraphKernel;
   for (size_t i = 0; i < orderedTraceEvents.size(); ++i) {
     const auto &event = orderedTraceEvents[i];
     if (event.kind != OrderedTraceEvent::Kind::Kernel || !event.isGraphLinked) {
@@ -924,10 +946,42 @@ void reconstructGraphScopeEvents(std::vector<OrderedTraceEvent> &orderedTraceEve
     if (scopeContexts.empty()) {
       continue;
     }
-    groupToGraphKernels[{event.owningEventId, event.streamId}].push_back(
-        GraphKernelRecord{i, event.owningEventId, event.streamId,
-                          event.startTimeNs, event.endTimeNs,
-                          std::move(scopeContexts), event.getFlexibleMetrics()});
+    auto record =
+        GraphKernelRecord{i, event.owningEventId, event.streamId, event.startTimeNs,
+                          event.endTimeNs, std::move(scopeContexts),
+                          event.getFlexibleMetrics()};
+    groupToGraphKernels[{event.owningEventId, event.streamId}].push_back(record);
+    auto firstGraphKernelIt = owningEventIdToFirstGraphKernel.find(event.owningEventId);
+    if (firstGraphKernelIt == owningEventIdToFirstGraphKernel.end() ||
+        record.startTimeNs < firstGraphKernelIt->second.startTimeNs ||
+        (record.startTimeNs == firstGraphKernelIt->second.startTimeNs &&
+         record.endTimeNs < firstGraphKernelIt->second.endTimeNs) ||
+        (record.startTimeNs == firstGraphKernelIt->second.startTimeNs &&
+         record.endTimeNs == firstGraphKernelIt->second.endTimeNs &&
+         record.orderedEventIndex < firstGraphKernelIt->second.orderedEventIndex)) {
+      owningEventIdToFirstGraphKernel[event.owningEventId] = record;
+    }
+  }
+
+  std::map<size_t, std::optional<int64_t>> owningEventIdToClockOffsetNs;
+  for (const auto &[owningEventId, firstGraphKernel] : owningEventIdToFirstGraphKernel) {
+    const auto &firstKernelEvent =
+        orderedTraceEvents[firstGraphKernel.orderedEventIndex];
+    std::optional<uint64_t> anchorTimeNs;
+    if (auto flowSource =
+            getCpuFlowSourceScopeEventIdAndTimeNs(firstKernelEvent, events);
+        flowSource) {
+      anchorTimeNs = flowSource->second;
+    } else if (auto traceEventIt = events.find(owningEventId);
+               traceEventIt != events.end() &&
+               traceEventIt->second.hasCpuStartTime) {
+      anchorTimeNs = traceEventIt->second.cpuStartTimeNs;
+    }
+    if (anchorTimeNs) {
+      owningEventIdToClockOffsetNs[owningEventId] =
+          static_cast<int64_t>(*anchorTimeNs) -
+          static_cast<int64_t>(firstGraphKernel.startTimeNs);
+    }
   }
 
   std::vector<OrderedTraceEvent> graphScopeEvents;
@@ -942,6 +996,13 @@ void reconstructGraphScopeEvents(std::vector<OrderedTraceEvent> &orderedTraceEve
                 }
                 return lhs.orderedEventIndex < rhs.orderedEventIndex;
               });
+
+    const auto graphClockOffsetIt =
+        owningEventIdToClockOffsetNs.find(graphKernelRecords.front().owningEventId);
+    const auto graphClockOffsetNs =
+        graphClockOffsetIt != owningEventIdToClockOffsetNs.end()
+            ? graphClockOffsetIt->second
+            : std::nullopt;
 
     std::vector<OpenGraphScope> openScopes;
     std::vector<GraphScopeRange> graphScopeRanges;
@@ -1013,6 +1074,7 @@ void reconstructGraphScopeEvents(std::vector<OrderedTraceEvent> &orderedTraceEve
       }
       auto &kernelEvent = orderedTraceEvents[record.orderedEventIndex];
       auto &graphScopeRange = graphScopeRanges[*rangeIndex];
+      kernelEvent.explicitClockOffsetNs = graphClockOffsetNs;
       kernelEvent.hasGraphFlowSource = true;
       kernelEvent.graphFlowStartTimeNs = graphScopeRange.startTimeNs;
       kernelEvent.graphFlowEndTimeNs = graphScopeRange.endTimeNs;
@@ -1032,7 +1094,7 @@ void reconstructGraphScopeEvents(std::vector<OrderedTraceEvent> &orderedTraceEve
       graphScopeEvents.push_back(OrderedTraceEvent::graphScope(
           std::move(graphScopeRange.contexts), graphScopeRange.streamId,
           graphScopeRange.startTimeNs, graphScopeRange.endTimeNs,
-          std::move(flexibleMetricsStorage)));
+          std::move(flexibleMetricsStorage), graphClockOffsetNs));
     }
   }
 
@@ -1062,9 +1124,12 @@ void dumpKernelMetricTrace(
       const auto alignedStartTimeNs =
           getAlignedStartTimeNs(event, kernelClockOffsetNs);
       if (event.hasGraphFlowSource) {
+        const auto alignedGraphFlowStartTimeNs = getAlignedTimestampNs(
+            event.graphFlowStartTimeNs,
+            getClockOffsetNs(event, kernelClockOffsetNs));
         minTimeStamp =
             std::min(minTimeStamp,
-                     std::min(event.graphFlowStartTimeNs, alignedStartTimeNs));
+                     std::min(alignedGraphFlowStartTimeNs, alignedStartTimeNs));
       } else if (auto flowSource =
                      getCpuFlowSourceScopeEventIdAndTimeNs(event, events);
                  flowSource) {
@@ -1128,15 +1193,18 @@ void dumpKernelMetricTrace(
       return;
     }
     if (event.hasGraphFlowSource) {
-      const auto graphFlowStartTimeNs =
-          std::min(event.graphFlowStartTimeNs, alignedStartTimeNs);
+      const auto alignedGraphFlowStartTimeNs = std::min(
+          getAlignedTimestampNs(event.graphFlowStartTimeNs,
+                                getClockOffsetNs(event, kernelClockOffsetNs)),
+          alignedStartTimeNs);
       json flowStart = {{"name", kLaunchFlowName},
                         {"cat", kLaunchFlowCategory},
                         {"ph", "s"},
                         {"bp", "e"},
                         {"id", nextFlowId},
                         {"ts",
-                         static_cast<double>(graphFlowStartTimeNs - minTimeStamp) /
+                         static_cast<double>(alignedGraphFlowStartTimeNs -
+                                             minTimeStamp) /
                              1000.0},
                         {"tid", getGraphTid(event.streamId)}};
       json flowFinish = {{"name", kLaunchFlowName},
@@ -1337,7 +1405,7 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
       hasCpuScopeEvents = true;
     }
 
-    reconstructGraphScopeEvents(orderedTraceEvents);
+    reconstructGraphScopeEvents(orderedTraceEvents, events);
 
     if (hasCycleMetrics) {
       dumpCycleMetricTrace(cycleEvents, os);

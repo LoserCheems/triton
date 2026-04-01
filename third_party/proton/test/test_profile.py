@@ -1084,12 +1084,15 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
 
     trace_events = data["traceEvents"]
 
+    def get_call_stack(event):
+        return event.get("args", {}).get("call_stack", [])
+
     def has_stack(event, expected_stack):
-        return event["args"].get("call_stack") == expected_stack
+        return get_call_stack(event) == expected_stack
 
     replay_graph_events = [
         event for event in trace_events
-        if event["tid"].startswith("Graph: Stream ") and "test0" in event["args"].get("call_stack", [])
+        if event.get("tid", "").startswith("Graph: Stream ") and "test0" in get_call_stack(event)
     ]
     assert replay_graph_events
     graph_tid = replay_graph_events[0]["tid"]
@@ -1129,8 +1132,8 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
 
     replay_kernel_events = [
         event for event in trace_events
-        if event["cat"] == "kernel" and "test0" in event["args"].get("call_stack", [])
-        and "<captured_at>" in event["args"].get("call_stack", [])
+        if event["cat"] == "kernel" and "test0" in get_call_stack(event)
+        and "<captured_at>" in get_call_stack(event)
     ]
     foo_events = [event for event in replay_kernel_events if event["name"] == "foo"]
     metric_kernel_events = [event for event in replay_kernel_events if event["name"] == "<metric>"]
@@ -1206,12 +1209,15 @@ def test_trace_cudagraph_metric_only_scope_path(tmp_path: pathlib.Path, device: 
 
     trace_events = data["traceEvents"]
 
+    def get_call_stack(event):
+        return event.get("args", {}).get("call_stack", [])
+
     def has_stack(event, expected_stack):
-        return event["args"].get("call_stack") == expected_stack
+        return get_call_stack(event) == expected_stack
 
     replay_graph_events = [
         event for event in trace_events
-        if event["tid"].startswith("Graph: Stream ") and "test0" in event["args"].get("call_stack", [])
+        if event.get("tid", "").startswith("Graph: Stream ") and "test0" in get_call_stack(event)
     ]
     assert replay_graph_events
     graph_tid = replay_graph_events[0]["tid"]
@@ -1239,7 +1245,7 @@ def test_trace_cudagraph_metric_only_scope_path(tmp_path: pathlib.Path, device: 
         event for event in trace_events
         if event["cat"] == "kernel"
         and event["name"] == "<metric>"
-        and event["args"].get("call_stack") == [
+        and get_call_stack(event) == [
             "ROOT", "test0", "<captured_at>", "outer", "inner", "<metric>"
         ]
     ]

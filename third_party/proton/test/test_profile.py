@@ -1040,6 +1040,223 @@ def test_trace_flexible_metrics_no_kernel_anchor(tmp_path: pathlib.Path):
     assert metric_event["args"]["metrics"] == {"foo": "1.000000"}
 
 
+@pytest.mark.skipif(not is_cuda(), reason="Only CUDA backend supports cudagraph trace reconstruction")
+def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str):
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+
+    @triton.jit
+    def foo(x, y, size: tl.constexpr):
+        offs = tl.arange(0, size)
+        tl.store(y + offs, tl.load(x + offs))
+
+    x = torch.ones((128, ), device=device, dtype=torch.float32)
+    y = torch.zeros_like(x)
+    metric_tensor = torch.tensor(1.0, device=device)
+
+    foo[(1, )](x, y, x.numel(), num_warps=4)
+    torch.cuda.synchronize(torch.device(device))
+
+    def fn():
+        with proton.scope("a"):
+            with proton.scope("b"):
+                with proton.scope("c", metrics={"m1": metric_tensor}):
+                    foo[(1, )](x, y, x.numel(), num_warps=4)
+                foo[(1, )](x, y, x.numel(), num_warps=4)
+            foo[(1, )](x, y, x.numel(), num_warps=4)
+
+    temp_file = tmp_path / "test_trace_cudagraph_graph_scope_ranges.chrome_trace"
+    proton.start(str(temp_file.with_suffix("")), data="trace", context="shadow")
+
+    fn()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+
+    with proton.scope("test0"):
+        g.replay()
+
+    proton.finalize()
+
+    with temp_file.open() as f:
+        data = json.load(f)
+
+    trace_events = data["traceEvents"]
+
+    def has_stack(event, expected_stack):
+        return event["args"].get("call_stack") == expected_stack
+
+    replay_graph_events = [
+        event for event in trace_events
+        if event["tid"].startswith("Graph: Stream ") and "test0" in event["args"].get("call_stack", [])
+    ]
+    assert replay_graph_events
+    graph_tid = replay_graph_events[0]["tid"]
+    assert all(event["tid"] == graph_tid for event in replay_graph_events)
+
+    capture_event = next(
+        event for event in replay_graph_events
+        if has_stack(event, ["ROOT", "test0", "<captured_at>"])
+    )
+    scope_a = next(
+        event for event in replay_graph_events
+        if has_stack(event, ["ROOT", "test0", "<captured_at>", "a"])
+    )
+    scope_b = next(
+        event for event in replay_graph_events
+        if has_stack(event, ["ROOT", "test0", "<captured_at>", "a", "b"])
+    )
+    scope_c = next(
+        event for event in replay_graph_events
+        if has_stack(event, ["ROOT", "test0", "<captured_at>", "a", "b", "c"])
+    )
+
+    assert capture_event["name"] == "<captured_at>"
+    assert capture_event["cat"] == "scope"
+    assert scope_a["name"] == "a"
+    assert scope_a["cat"] == "scope"
+    assert scope_b["name"] == "b"
+    assert scope_b["cat"] == "scope"
+    assert scope_c["name"] == "c: <m1, 1.000000>"
+    assert scope_c["cat"] == "metric"
+    assert scope_c["args"]["metrics"] == {"m1": "1.000000"}
+
+    assert capture_event["ts"] <= scope_a["ts"] <= scope_b["ts"] <= scope_c["ts"]
+    assert scope_c["ts"] + scope_c["dur"] <= scope_b["ts"] + scope_b["dur"]
+    assert scope_b["ts"] + scope_b["dur"] <= scope_a["ts"] + scope_a["dur"]
+    assert scope_a["ts"] + scope_a["dur"] <= capture_event["ts"] + capture_event["dur"]
+
+    replay_kernel_events = [
+        event for event in trace_events
+        if event["cat"] == "kernel" and "test0" in event["args"].get("call_stack", [])
+        and "<captured_at>" in event["args"].get("call_stack", [])
+    ]
+    foo_events = [event for event in replay_kernel_events if event["name"] == "foo"]
+    metric_kernel_events = [event for event in replay_kernel_events if event["name"] == "<metric>"]
+
+    assert len(foo_events) == 3
+    assert len(metric_kernel_events) == 1
+    metric_kernel_event = metric_kernel_events[0]
+    assert metric_kernel_event["args"]["call_stack"] == [
+        "ROOT", "test0", "<captured_at>", "a", "b", "c", "<metric>"
+    ]
+
+    flow_starts = [event for event in trace_events if event["cat"] == "flow" and event["ph"] == "s"]
+    flow_finishes = [event for event in trace_events if event["cat"] == "flow" and event["ph"] == "f"]
+
+    def get_flow_start_for_kernel(kernel_event):
+        flow_finish = next(
+            event for event in flow_finishes
+            if event["tid"] == kernel_event["tid"] and event["ts"] == kernel_event["ts"]
+        )
+        return next(event for event in flow_starts if event["id"] == flow_finish["id"])
+
+    kernel_abc = next(
+        event for event in foo_events
+        if event["args"]["call_stack"] == ["ROOT", "test0", "<captured_at>", "a", "b", "c", "foo"]
+    )
+    kernel_ab = next(
+        event for event in foo_events
+        if event["args"]["call_stack"] == ["ROOT", "test0", "<captured_at>", "a", "b", "foo"]
+    )
+    kernel_a = next(
+        event for event in foo_events
+        if event["args"]["call_stack"] == ["ROOT", "test0", "<captured_at>", "a", "foo"]
+    )
+
+    for kernel_event, scope_event in [
+        (metric_kernel_event, scope_c),
+        (kernel_abc, scope_c),
+        (kernel_ab, scope_b),
+        (kernel_a, scope_a),
+    ]:
+        flow_start = get_flow_start_for_kernel(kernel_event)
+        assert flow_start["tid"] == graph_tid
+        assert scope_event["ts"] <= flow_start["ts"] <= scope_event["ts"] + scope_event["dur"]
+
+
+@pytest.mark.skipif(not is_cuda(), reason="Only CUDA backend supports cudagraph trace reconstruction")
+def test_trace_cudagraph_metric_only_scope_path(tmp_path: pathlib.Path, device: str):
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+    metric_tensor = torch.tensor(2.0, device=device)
+
+    def fn():
+        with proton.scope("outer"):
+            with proton.scope("inner", metrics={"metric_only": metric_tensor}):
+                pass
+
+    temp_file = tmp_path / "test_trace_cudagraph_metric_only_scope_path.chrome_trace"
+    proton.start(str(temp_file.with_suffix("")), data="trace", context="shadow")
+
+    fn()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+
+    with proton.scope("test0"):
+        g.replay()
+
+    proton.finalize()
+
+    with temp_file.open() as f:
+        data = json.load(f)
+
+    trace_events = data["traceEvents"]
+
+    def has_stack(event, expected_stack):
+        return event["args"].get("call_stack") == expected_stack
+
+    replay_graph_events = [
+        event for event in trace_events
+        if event["tid"].startswith("Graph: Stream ") and "test0" in event["args"].get("call_stack", [])
+    ]
+    assert replay_graph_events
+    graph_tid = replay_graph_events[0]["tid"]
+
+    capture_event = next(
+        event for event in replay_graph_events
+        if has_stack(event, ["ROOT", "test0", "<captured_at>"])
+    )
+    outer_event = next(
+        event for event in replay_graph_events
+        if has_stack(event, ["ROOT", "test0", "<captured_at>", "outer"])
+    )
+    inner_event = next(
+        event for event in replay_graph_events
+        if has_stack(event, ["ROOT", "test0", "<captured_at>", "outer", "inner"])
+    )
+
+    assert capture_event["cat"] == "scope"
+    assert outer_event["cat"] == "scope"
+    assert inner_event["name"] == "inner: <metric_only, 2.000000>"
+    assert inner_event["cat"] == "metric"
+    assert inner_event["args"]["metrics"] == {"metric_only": "2.000000"}
+
+    replay_metric_kernels = [
+        event for event in trace_events
+        if event["cat"] == "kernel"
+        and event["name"] == "<metric>"
+        and event["args"].get("call_stack") == [
+            "ROOT", "test0", "<captured_at>", "outer", "inner", "<metric>"
+        ]
+    ]
+    assert len(replay_metric_kernels) == 1
+
+    flow_starts = [event for event in trace_events if event["cat"] == "flow" and event["ph"] == "s"]
+    flow_finishes = [event for event in trace_events if event["cat"] == "flow" and event["ph"] == "f"]
+    metric_kernel_event = replay_metric_kernels[0]
+    flow_finish = next(
+        event for event in flow_finishes
+        if event["tid"] == metric_kernel_event["tid"] and event["ts"] == metric_kernel_event["ts"]
+    )
+    flow_start = next(event for event in flow_starts if event["id"] == flow_finish["id"])
+    assert flow_start["tid"] == graph_tid
+    assert inner_event["ts"] <= flow_start["ts"] <= inner_event["ts"] + inner_event["dur"]
+
+
 @pytest.mark.parametrize("profile_kind,suffix", [("tree", ".hatchet"), ("trace", ".chrome_trace")],
                          ids=["tree", "trace"])
 def test_multi_stream(profile_kind: str, suffix: str, tmp_path: pathlib.Path, device: str):

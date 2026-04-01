@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -297,11 +298,12 @@ constexpr const char *kLaunchFlowName = "launch->kernel";
 constexpr const char *kLaunchFlowCategory = "flow";
 
 struct OrderedTraceEvent {
-  enum class Kind { Kernel, CpuScope };
+  enum class Kind { Kernel, CpuScope, GraphScope };
 
   Kind kind;
   const KernelMetric *kernelMetric{};
   const DataEntry::FlexibleMetricMap *flexibleMetrics{};
+  std::shared_ptr<DataEntry::FlexibleMetricMap> flexibleMetricsStorage;
   std::vector<Context> contexts;
   size_t owningEventId = TraceData::Trace::TraceEvent::DummyId;
   size_t launchScopeEventId = TraceData::Trace::TraceEvent::DummyId;
@@ -309,12 +311,23 @@ struct OrderedTraceEvent {
   size_t streamId = 0;
   uint64_t startTimeNs = 0;
   uint64_t endTimeNs = 0;
+  bool isGraphLinked = false;
+  bool isMetricKernel = false;
+  bool hasGraphFlowSource = false;
+  uint64_t graphFlowStartTimeNs = 0;
+  uint64_t graphFlowEndTimeNs = 0;
+
+  const DataEntry::FlexibleMetricMap *getFlexibleMetrics() const {
+    return flexibleMetricsStorage ? flexibleMetricsStorage.get()
+                                  : flexibleMetrics;
+  }
 
   static OrderedTraceEvent kernel(const KernelMetric *metric,
                                   const DataEntry::FlexibleMetricMap *metrics,
                                   std::vector<Context> contexts,
                                   size_t owningEventId, size_t streamId,
-                                  size_t launchScopeEventId) {
+                                  size_t launchScopeEventId,
+                                  bool isGraphLinked, bool isMetricKernel) {
     OrderedTraceEvent event;
     event.kind = Kind::Kernel;
     event.kernelMetric = metric;
@@ -327,6 +340,8 @@ struct OrderedTraceEvent {
         std::get<uint64_t>(metric->getValue(KernelMetric::StartTime));
     event.endTimeNs =
         std::get<uint64_t>(metric->getValue(KernelMetric::EndTime));
+    event.isGraphLinked = isGraphLinked;
+    event.isMetricKernel = isMetricKernel;
     return event;
   }
 
@@ -342,6 +357,47 @@ struct OrderedTraceEvent {
     event.endTimeNs = endTimeNs;
     return event;
   }
+
+  static OrderedTraceEvent graphScope(
+      std::vector<Context> contexts, size_t streamId, uint64_t startTimeNs,
+      uint64_t endTimeNs,
+      std::shared_ptr<DataEntry::FlexibleMetricMap> flexibleMetricsStorage =
+          nullptr) {
+    OrderedTraceEvent event;
+    event.kind = Kind::GraphScope;
+    event.contexts = std::move(contexts);
+    event.streamId = streamId;
+    event.startTimeNs = startTimeNs;
+    event.endTimeNs = endTimeNs;
+    event.flexibleMetricsStorage = std::move(flexibleMetricsStorage);
+    event.flexibleMetrics = event.flexibleMetricsStorage
+                                ? event.flexibleMetricsStorage.get()
+                                : nullptr;
+    return event;
+  }
+};
+
+struct GraphKernelRecord {
+  size_t orderedEventIndex{};
+  size_t owningEventId{};
+  size_t streamId{};
+  uint64_t startTimeNs{};
+  uint64_t endTimeNs{};
+  std::vector<Context> scopeContexts;
+  const DataEntry::FlexibleMetricMap *flexibleMetrics{};
+};
+
+struct GraphScopeRange {
+  std::vector<Context> contexts;
+  size_t streamId{};
+  uint64_t startTimeNs{};
+  uint64_t endTimeNs{};
+  DataEntry::FlexibleMetricMap flexibleMetrics{};
+};
+
+struct OpenGraphScope {
+  std::vector<Context> contexts;
+  uint64_t startTimeNs{};
 };
 
 std::string formatFlexibleMetricValue(const MetricValueType &value) {
@@ -371,6 +427,11 @@ std::string formatFlexibleMetricValue(const MetricValueType &value) {
         }
       },
       value);
+}
+
+bool hasFlexibleMetrics(const OrderedTraceEvent &event) {
+  const auto *flexibleMetrics = event.getFlexibleMetrics();
+  return flexibleMetrics != nullptr && !flexibleMetrics->empty();
 }
 
 json buildCallStackJson(const std::vector<Context> &contexts) {
@@ -607,6 +668,78 @@ bool isContextPrefix(const std::vector<Context> &prefix,
   return true;
 }
 
+std::optional<size_t>
+findContextIndexByName(const std::vector<Context> &contexts,
+                       const std::string &name) {
+  for (size_t i = 0; i < contexts.size(); ++i) {
+    if (contexts[i].name == name) {
+      return i;
+    }
+  }
+  return std::nullopt;
+}
+
+std::vector<Context> getGraphScopeContexts(const OrderedTraceEvent &event) {
+  if (!event.isGraphLinked || event.contexts.empty()) {
+    return {};
+  }
+  auto captureIndex = findContextIndexByName(event.contexts, GraphState::captureTag);
+  if (!captureIndex || *captureIndex >= event.contexts.size() - 1) {
+    return {};
+  }
+  return std::vector<Context>(event.contexts.begin(), event.contexts.end() - 1);
+}
+
+std::vector<std::vector<Context>>
+buildGraphScopePrefixes(const std::vector<Context> &scopeContexts) {
+  std::vector<std::vector<Context>> prefixes;
+  auto captureIndex =
+      findContextIndexByName(scopeContexts, GraphState::captureTag);
+  if (!captureIndex) {
+    return prefixes;
+  }
+  prefixes.reserve(scopeContexts.size() - *captureIndex);
+  for (size_t i = *captureIndex; i < scopeContexts.size(); ++i) {
+    prefixes.emplace_back(scopeContexts.begin(), scopeContexts.begin() + i + 1);
+  }
+  return prefixes;
+}
+
+void upsertFlexibleMetric(DataEntry::FlexibleMetricMap &dst,
+                          const std::string &metricName,
+                          const FlexibleMetric &metric) {
+  auto it = dst.find(metricName);
+  if (it == dst.end()) {
+    dst.emplace(metricName, metric);
+  } else {
+    it->second.updateValue(metric.getValues()[0]);
+  }
+}
+
+void mergeFlexibleMetrics(DataEntry::FlexibleMetricMap &dst,
+                          const DataEntry::FlexibleMetricMap &src) {
+  for (const auto &[metricName, metric] : src) {
+    upsertFlexibleMetric(dst, metricName, metric);
+  }
+}
+
+std::optional<size_t> findGraphScopeRangeIndex(
+    const std::map<std::vector<Context>, std::vector<size_t>> &contextToIndices,
+    const std::vector<Context> &contexts, uint64_t startTimeNs,
+    uint64_t endTimeNs, const std::vector<GraphScopeRange> &graphScopeRanges) {
+  auto it = contextToIndices.find(contexts);
+  if (it == contextToIndices.end()) {
+    return std::nullopt;
+  }
+  for (auto rangeIndex : it->second) {
+    const auto &range = graphScopeRanges[rangeIndex];
+    if (range.startTimeNs <= startTimeNs && range.endTimeNs >= endTimeNs) {
+      return rangeIndex;
+    }
+  }
+  return std::nullopt;
+}
+
 std::vector<Context>
 normalizeKernelContextsForLaunchScope(const std::vector<Context> &contexts,
                                       const std::vector<Context> &scopeContexts) {
@@ -697,7 +830,7 @@ std::optional<int64_t> computeKernelClockOffsetNs(
   std::vector<int64_t> offsets;
   offsets.reserve(orderedTraceEvents.size());
   for (const auto &event : orderedTraceEvents) {
-    if (event.kind != OrderedTraceEvent::Kind::Kernel) {
+    if (event.kind != OrderedTraceEvent::Kind::Kernel || event.isGraphLinked) {
       continue;
     }
     auto traceEventIt = events.find(event.owningEventId);
@@ -717,7 +850,8 @@ std::optional<int64_t> computeKernelClockOffsetNs(
 
 uint64_t getAlignedStartTimeNs(const OrderedTraceEvent &event,
                                const std::optional<int64_t> &kernelClockOffsetNs) {
-  if (event.kind != OrderedTraceEvent::Kind::Kernel || !kernelClockOffsetNs) {
+  if (event.kind != OrderedTraceEvent::Kind::Kernel || event.isGraphLinked ||
+      !kernelClockOffsetNs) {
     return event.startTimeNs;
   }
   const auto alignedStart =
@@ -733,8 +867,11 @@ std::string getStreamTid(size_t streamId) {
   return "Stream: " + std::to_string(streamId);
 }
 
-std::optional<std::pair<size_t, uint64_t>>
-getFlowSourceScopeEventIdAndTimeNs(
+std::string getGraphTid(size_t streamId) {
+  return "Graph: Stream " + std::to_string(streamId);
+}
+
+std::optional<std::pair<size_t, uint64_t>> getCpuFlowSourceScopeEventIdAndTimeNs(
     const OrderedTraceEvent &event,
     const std::map<size_t, TraceData::Trace::TraceEvent> &events) {
   if (event.launchScopeEventId == TraceData::Trace::TraceEvent::DummyId) {
@@ -775,6 +912,135 @@ uint64_t getAdjustedFlowStartTimeNs(
                     latestFlowStartTimeNs);
 }
 
+void reconstructGraphScopeEvents(std::vector<OrderedTraceEvent> &orderedTraceEvents) {
+  using GroupKey = std::pair<size_t, size_t>;
+  std::map<GroupKey, std::vector<GraphKernelRecord>> groupToGraphKernels;
+  for (size_t i = 0; i < orderedTraceEvents.size(); ++i) {
+    const auto &event = orderedTraceEvents[i];
+    if (event.kind != OrderedTraceEvent::Kind::Kernel || !event.isGraphLinked) {
+      continue;
+    }
+    auto scopeContexts = getGraphScopeContexts(event);
+    if (scopeContexts.empty()) {
+      continue;
+    }
+    groupToGraphKernels[{event.owningEventId, event.streamId}].push_back(
+        GraphKernelRecord{i, event.owningEventId, event.streamId,
+                          event.startTimeNs, event.endTimeNs,
+                          std::move(scopeContexts), event.getFlexibleMetrics()});
+  }
+
+  std::vector<OrderedTraceEvent> graphScopeEvents;
+  for (auto &[_, graphKernelRecords] : groupToGraphKernels) {
+    std::sort(graphKernelRecords.begin(), graphKernelRecords.end(),
+              [](const GraphKernelRecord &lhs, const GraphKernelRecord &rhs) {
+                if (lhs.startTimeNs != rhs.startTimeNs) {
+                  return lhs.startTimeNs < rhs.startTimeNs;
+                }
+                if (lhs.endTimeNs != rhs.endTimeNs) {
+                  return lhs.endTimeNs < rhs.endTimeNs;
+                }
+                return lhs.orderedEventIndex < rhs.orderedEventIndex;
+              });
+
+    std::vector<OpenGraphScope> openScopes;
+    std::vector<GraphScopeRange> graphScopeRanges;
+    uint64_t previousEndTimeNs = 0;
+    bool hasPreviousRange = false;
+
+    for (const auto &record : graphKernelRecords) {
+      auto scopePrefixes = buildGraphScopePrefixes(record.scopeContexts);
+      if (scopePrefixes.empty()) {
+        continue;
+      }
+
+      size_t commonPrefixSize = 0;
+      while (commonPrefixSize < openScopes.size() &&
+             commonPrefixSize < scopePrefixes.size() &&
+             openScopes[commonPrefixSize].contexts ==
+                 scopePrefixes[commonPrefixSize]) {
+        ++commonPrefixSize;
+      }
+
+      if (hasPreviousRange) {
+        while (openScopes.size() > commonPrefixSize) {
+          auto openScope = std::move(openScopes.back());
+          openScopes.pop_back();
+          graphScopeRanges.push_back(GraphScopeRange{
+              std::move(openScope.contexts), record.streamId,
+              openScope.startTimeNs, previousEndTimeNs, {}});
+        }
+      }
+
+      for (size_t i = commonPrefixSize; i < scopePrefixes.size(); ++i) {
+        openScopes.push_back(
+            OpenGraphScope{std::move(scopePrefixes[i]), record.startTimeNs});
+      }
+      previousEndTimeNs = record.endTimeNs;
+      hasPreviousRange = true;
+    }
+
+    while (!openScopes.empty()) {
+      auto openScope = std::move(openScopes.back());
+      openScopes.pop_back();
+      graphScopeRanges.push_back(GraphScopeRange{
+          std::move(openScope.contexts), graphKernelRecords.front().streamId,
+          openScope.startTimeNs, previousEndTimeNs, {}});
+    }
+
+    std::sort(graphScopeRanges.begin(), graphScopeRanges.end(),
+              [](const GraphScopeRange &lhs, const GraphScopeRange &rhs) {
+                if (lhs.startTimeNs != rhs.startTimeNs) {
+                  return lhs.startTimeNs < rhs.startTimeNs;
+                }
+                if (lhs.endTimeNs != rhs.endTimeNs) {
+                  return lhs.endTimeNs > rhs.endTimeNs;
+                }
+                return lhs.contexts.size() < rhs.contexts.size();
+              });
+
+    std::map<std::vector<Context>, std::vector<size_t>> contextToIndices;
+    for (size_t i = 0; i < graphScopeRanges.size(); ++i) {
+      contextToIndices[graphScopeRanges[i].contexts].push_back(i);
+    }
+
+    for (const auto &record : graphKernelRecords) {
+      auto rangeIndex = findGraphScopeRangeIndex(
+          contextToIndices, record.scopeContexts, record.startTimeNs,
+          record.endTimeNs, graphScopeRanges);
+      if (!rangeIndex) {
+        continue;
+      }
+      auto &kernelEvent = orderedTraceEvents[record.orderedEventIndex];
+      auto &graphScopeRange = graphScopeRanges[*rangeIndex];
+      kernelEvent.hasGraphFlowSource = true;
+      kernelEvent.graphFlowStartTimeNs = graphScopeRange.startTimeNs;
+      kernelEvent.graphFlowEndTimeNs = graphScopeRange.endTimeNs;
+      if (kernelEvent.isMetricKernel && record.flexibleMetrics &&
+          !record.flexibleMetrics->empty()) {
+        mergeFlexibleMetrics(graphScopeRange.flexibleMetrics,
+                             *record.flexibleMetrics);
+      }
+    }
+
+    for (auto &graphScopeRange : graphScopeRanges) {
+      std::shared_ptr<DataEntry::FlexibleMetricMap> flexibleMetricsStorage;
+      if (!graphScopeRange.flexibleMetrics.empty()) {
+        flexibleMetricsStorage = std::make_shared<DataEntry::FlexibleMetricMap>(
+            std::move(graphScopeRange.flexibleMetrics));
+      }
+      graphScopeEvents.push_back(OrderedTraceEvent::graphScope(
+          std::move(graphScopeRange.contexts), graphScopeRange.streamId,
+          graphScopeRange.startTimeNs, graphScopeRange.endTimeNs,
+          std::move(flexibleMetricsStorage)));
+    }
+  }
+
+  orderedTraceEvents.insert(orderedTraceEvents.end(),
+                            std::make_move_iterator(graphScopeEvents.begin()),
+                            std::make_move_iterator(graphScopeEvents.end()));
+}
+
 void dumpKernelMetricTrace(
     const std::vector<OrderedTraceEvent> &orderedTraceEvents,
     const std::map<size_t, TraceData::Trace::TraceEvent> &events,
@@ -795,8 +1061,13 @@ void dumpKernelMetricTrace(
     if (event.kind == OrderedTraceEvent::Kind::Kernel) {
       const auto alignedStartTimeNs =
           getAlignedStartTimeNs(event, kernelClockOffsetNs);
-      auto flowSource = getFlowSourceScopeEventIdAndTimeNs(event, events);
-      if (flowSource) {
+      if (event.hasGraphFlowSource) {
+        minTimeStamp =
+            std::min(minTimeStamp,
+                     std::min(event.graphFlowStartTimeNs, alignedStartTimeNs));
+      } else if (auto flowSource =
+                     getCpuFlowSourceScopeEventIdAndTimeNs(event, events);
+                 flowSource) {
         const auto &scopeEvent = events.at(flowSource->first);
         minTimeStamp = std::min(
             minTimeStamp, getAdjustedFlowStartTimeNs(flowSource->second,
@@ -807,30 +1078,38 @@ void dumpKernelMetricTrace(
   }
   uint64_t nextFlowId = 0;
   auto appendTraceEvent = [&](const OrderedTraceEvent &event) {
-    if (event.kind == OrderedTraceEvent::Kind::CpuScope &&
+    if ((event.kind == OrderedTraceEvent::Kind::CpuScope ||
+         event.kind == OrderedTraceEvent::Kind::GraphScope) &&
         event.contexts.empty()) {
       return;
     }
 
     json element;
     if (event.kind == OrderedTraceEvent::Kind::Kernel) {
-      if (event.flexibleMetrics) {
+      if (event.isMetricKernel) {
         element["name"] = GraphState::metricTag;
       } else {
         element["name"] = event.contexts.back().name;
       }
       element["cat"] = "kernel";
       element["tid"] = getStreamTid(event.streamId);
-    } else {
-      const bool hasFlexibleMetrics =
-          event.flexibleMetrics && !event.flexibleMetrics->empty();
-      element["name"] = hasFlexibleMetrics
+    } else if (event.kind == OrderedTraceEvent::Kind::CpuScope) {
+      const bool eventHasFlexibleMetrics = hasFlexibleMetrics(event);
+      element["name"] = eventHasFlexibleMetrics
                             ? buildFlexibleMetricEventName(
-                                  event.contexts, *event.flexibleMetrics)
+                                  event.contexts, *event.getFlexibleMetrics())
                             : event.contexts.back().name;
-      element["cat"] = hasFlexibleMetrics ? "metric" : "scope";
+      element["cat"] = eventHasFlexibleMetrics ? "metric" : "scope";
       element["tid"] = getCpuThreadTid(event.threadId);
       element["args"]["thread_id"] = event.threadId;
+    } else {
+      const bool eventHasFlexibleMetrics = hasFlexibleMetrics(event);
+      element["name"] = eventHasFlexibleMetrics
+                            ? buildFlexibleMetricEventName(
+                                  event.contexts, *event.getFlexibleMetrics())
+                            : event.contexts.back().name;
+      element["cat"] = eventHasFlexibleMetrics ? "metric" : "scope";
+      element["tid"] = getGraphTid(event.streamId);
     }
     const auto alignedStartTimeNs =
         getAlignedStartTimeNs(event, kernelClockOffsetNs);
@@ -840,16 +1119,41 @@ void dumpKernelMetricTrace(
     element["dur"] =
         static_cast<double>(event.endTimeNs - event.startTimeNs) / 1000.0;
     element["args"]["call_stack"] = buildCallStackJson(event.contexts);
-    if (event.flexibleMetrics && !event.flexibleMetrics->empty()) {
+    if (hasFlexibleMetrics(event)) {
       element["args"]["metrics"] =
-          buildFlexibleMetricsJson(*event.flexibleMetrics);
+          buildFlexibleMetricsJson(*event.getFlexibleMetrics());
     }
     object["traceEvents"].push_back(element);
     if (event.kind != OrderedTraceEvent::Kind::Kernel) {
       return;
     }
-    const auto flowSource =
-        getFlowSourceScopeEventIdAndTimeNs(event, events);
+    if (event.hasGraphFlowSource) {
+      const auto graphFlowStartTimeNs =
+          std::min(event.graphFlowStartTimeNs, alignedStartTimeNs);
+      json flowStart = {{"name", kLaunchFlowName},
+                        {"cat", kLaunchFlowCategory},
+                        {"ph", "s"},
+                        {"bp", "e"},
+                        {"id", nextFlowId},
+                        {"ts",
+                         static_cast<double>(graphFlowStartTimeNs - minTimeStamp) /
+                             1000.0},
+                        {"tid", getGraphTid(event.streamId)}};
+      json flowFinish = {{"name", kLaunchFlowName},
+                         {"cat", kLaunchFlowCategory},
+                         {"ph", "f"},
+                         {"bp", "e"},
+                         {"id", nextFlowId},
+                         {"ts",
+                          static_cast<double>(alignedStartTimeNs - minTimeStamp) /
+                              1000.0},
+                         {"tid", getStreamTid(event.streamId)}};
+      object["traceEvents"].push_back(flowStart);
+      object["traceEvents"].push_back(flowFinish);
+      ++nextFlowId;
+      return;
+    }
+    const auto flowSource = getCpuFlowSourceScopeEventIdAndTimeNs(event, events);
     if (!flowSource) {
       return;
     }
@@ -882,6 +1186,11 @@ void dumpKernelMetricTrace(
 
   for (const auto &event : orderedTraceEvents) {
     if (event.kind == OrderedTraceEvent::Kind::CpuScope) {
+      appendTraceEvent(event);
+    }
+  }
+  for (const auto &event : orderedTraceEvents) {
+    if (event.kind == OrderedTraceEvent::Kind::GraphScope) {
       appendTraceEvent(event);
     }
   }
@@ -940,7 +1249,7 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
     auto processMetricMaps =
         [&](size_t owningEventId, const DataEntry::MetricMap &metrics,
             const DataEntry::FlexibleMetricMap *flexibleMetrics,
-            const std::vector<Context> &contexts) {
+            const std::vector<Context> &contexts, bool isGraphLinked) {
           bool emittedKernel = false;
           if (auto kernelIt = metrics.find(MetricKind::Kernel);
               kernelIt != metrics.end()) {
@@ -965,12 +1274,12 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
             if (isMetricKernel) {
               orderedTraceEvents.push_back(OrderedTraceEvent::kernel(
                   kernelMetric, flexibleMetrics, kernelContexts, owningEventId,
-                  streamId,
-                  launchScopeEventId));
+                  streamId, launchScopeEventId, isGraphLinked,
+                  isMetricKernel));
             } else {
               orderedTraceEvents.push_back(OrderedTraceEvent::kernel(
                   kernelMetric, nullptr, kernelContexts, owningEventId, streamId,
-                  launchScopeEventId));
+                  launchScopeEventId, isGraphLinked, isMetricKernel));
             }
             hasKernelMetrics = true;
             emittedKernel = true;
@@ -988,7 +1297,8 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
     for (const auto &[_, event] : events) {
       const auto &baseContexts = eventIdToContexts.at(event.id);
       processMetricMaps(event.id, event.metricSet.metrics,
-                        &event.metricSet.flexibleMetrics, baseContexts);
+                        &event.metricSet.flexibleMetrics, baseContexts,
+                        /*isGraphLinked=*/false);
       std::vector<size_t> sortedLinkedTargetEntryIds;
       sortedLinkedTargetEntryIds.reserve(event.metricSet.linkedMetrics.size());
       for (const auto &[targetEntryId, _] : event.metricSet.linkedMetrics) {
@@ -1008,7 +1318,8 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
         if (iter != event.metricSet.linkedFlexibleMetrics.end()) {
           flexibleMetrics = &iter->second;
         }
-        processMetricMaps(event.id, linkedMetrics, flexibleMetrics, contexts);
+        processMetricMaps(event.id, linkedMetrics, flexibleMetrics, contexts,
+                          /*isGraphLinked=*/true);
       }
       if (hasKernelMetrics && hasCycleMetrics) {
         throw std::runtime_error("only one active metric type is supported");
@@ -1025,6 +1336,8 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
           event.cpuEndTimeNs));
       hasCpuScopeEvents = true;
     }
+
+    reconstructGraphScopeEvents(orderedTraceEvents);
 
     if (hasCycleMetrics) {
       dumpCycleMetricTrace(cycleEvents, os);

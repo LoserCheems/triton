@@ -940,6 +940,20 @@ uint64_t getAdjustedFlowStartTimeNs(
                     latestFlowStartTimeNs);
 }
 
+uint64_t getAdjustedGraphFlowStartTimeNs(uint64_t alignedGraphScopeStartTimeNs,
+                                         uint64_t alignedGraphScopeEndTimeNs,
+                                         uint64_t alignedKernelStartTimeNs) {
+  auto latestFlowStartTimeNs =
+      std::min(alignedGraphScopeEndTimeNs, alignedKernelStartTimeNs);
+  if (latestFlowStartTimeNs > alignedGraphScopeStartTimeNs) {
+    latestFlowStartTimeNs -= 1;
+  }
+  if (latestFlowStartTimeNs < alignedGraphScopeStartTimeNs) {
+    return alignedGraphScopeStartTimeNs;
+  }
+  return latestFlowStartTimeNs;
+}
+
 void reconstructGraphScopeEvents(
     std::vector<OrderedTraceEvent> &orderedTraceEvents,
     const std::map<size_t, TraceData::Trace::TraceEvent> &events) {
@@ -1135,12 +1149,17 @@ void dumpKernelMetricTrace(
       const auto alignedStartTimeNs =
           getAlignedStartTimeNs(event, kernelClockOffsetNs);
       if (event.hasGraphFlowSource) {
-        const auto alignedGraphFlowStartTimeNs = getAlignedTimestampNs(
+        const auto alignedGraphScopeStartTimeNs = getAlignedTimestampNs(
             event.graphFlowStartTimeNs,
             getClockOffsetNs(event, kernelClockOffsetNs));
+        const auto alignedGraphScopeEndTimeNs = getAlignedTimestampNs(
+            event.graphFlowEndTimeNs, getClockOffsetNs(event, kernelClockOffsetNs));
+        const auto adjustedGraphFlowStartTimeNs = getAdjustedGraphFlowStartTimeNs(
+            alignedGraphScopeStartTimeNs, alignedGraphScopeEndTimeNs,
+            alignedStartTimeNs);
         minTimeStamp =
             std::min(minTimeStamp,
-                     std::min(alignedGraphFlowStartTimeNs, alignedStartTimeNs));
+                     std::min(adjustedGraphFlowStartTimeNs, alignedStartTimeNs));
       } else if (auto flowSource =
                      getCpuFlowSourceScopeEventIdAndTimeNs(event, events);
                  flowSource) {
@@ -1204,9 +1223,12 @@ void dumpKernelMetricTrace(
       return;
     }
     if (event.hasGraphFlowSource) {
-      const auto alignedGraphFlowStartTimeNs = std::min(
-          getAlignedTimestampNs(event.graphFlowStartTimeNs,
-                                getClockOffsetNs(event, kernelClockOffsetNs)),
+      const auto alignedGraphScopeStartTimeNs = getAlignedTimestampNs(
+          event.graphFlowStartTimeNs, getClockOffsetNs(event, kernelClockOffsetNs));
+      const auto alignedGraphScopeEndTimeNs = getAlignedTimestampNs(
+          event.graphFlowEndTimeNs, getClockOffsetNs(event, kernelClockOffsetNs));
+      const auto adjustedGraphFlowStartTimeNs = getAdjustedGraphFlowStartTimeNs(
+          alignedGraphScopeStartTimeNs, alignedGraphScopeEndTimeNs,
           alignedStartTimeNs);
       json flowStart = {{"name", kLaunchFlowName},
                         {"cat", kLaunchFlowCategory},
@@ -1214,7 +1236,7 @@ void dumpKernelMetricTrace(
                         {"bp", "e"},
                         {"id", nextFlowId},
                         {"ts",
-                         static_cast<double>(alignedGraphFlowStartTimeNs -
+                         static_cast<double>(adjustedGraphFlowStartTimeNs -
                                              minTimeStamp) /
                              1000.0},
                         {"tid", getGraphTid(event.streamId)}};

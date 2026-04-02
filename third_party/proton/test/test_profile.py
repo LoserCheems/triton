@@ -1172,6 +1172,9 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
         assert flow_start["tid"] == graph_tid
         assert scope_event["ts"] <= flow_start["ts"] <= scope_event["ts"] + scope_event["dur"]
 
+    assert get_flow_start_for_kernel(kernel_ab)["ts"] >= scope_c["ts"] + scope_c["dur"]
+    assert get_flow_start_for_kernel(kernel_a)["ts"] >= scope_b["ts"] + scope_b["dur"]
+
 
 @pytest.mark.skipif(not is_cuda(), reason="Only CUDA backend supports cudagraph trace reconstruction")
 def test_trace_cudagraph_metric_only_scope_path(tmp_path: pathlib.Path, device: str):

@@ -1249,6 +1249,11 @@ void dumpKernelMetricTrace(
         static_cast<double>(alignedStartTimeNs - minTimeStamp) / 1000.0;
     element["dur"] =
         static_cast<double>(event.endTimeNs - event.startTimeNs) / 1000.0;
+    element["args"]["call_stack"] = buildCallStackJson(event.contexts);
+    if (hasFlexibleMetrics(event)) {
+      element["args"]["metrics"] =
+          buildFlexibleMetricsJson(*event.getFlexibleMetrics());
+    }
     object["traceEvents"].push_back(element);
     if (event.kind != OrderedTraceEvent::Kind::Kernel) {
       return;

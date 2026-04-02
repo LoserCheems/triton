@@ -102,7 +102,7 @@ jobs:
         restore-keys: ${{ matrix.config.target-os }}-${{ matrix.config.arch }}-
 
     - name: Free disk space on Ubuntu
-      if: matrix.config.target-os == 'ubuntu'
+      if: matrix.config.arch == 'x64' && matrix.config.target-os == 'ubuntu'
       run: |
         df -h
         echo "Removing large packages"

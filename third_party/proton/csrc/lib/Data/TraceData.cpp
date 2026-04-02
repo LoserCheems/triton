@@ -752,6 +752,25 @@ std::optional<size_t> findGraphScopeRangeIndex(
   return std::nullopt;
 }
 
+uint64_t getGraphFlowBoundaryStartTimeNs(
+    const GraphScopeRange &targetRange, uint64_t kernelStartTimeNs,
+    const std::vector<GraphScopeRange> &graphScopeRanges) {
+  uint64_t boundaryStartTimeNs = targetRange.startTimeNs;
+  for (const auto &candidateRange : graphScopeRanges) {
+    if (candidateRange.contexts.size() <= targetRange.contexts.size()) {
+      continue;
+    }
+    if (!isContextPrefix(targetRange.contexts, candidateRange.contexts)) {
+      continue;
+    }
+    if (candidateRange.endTimeNs > kernelStartTimeNs) {
+      continue;
+    }
+    boundaryStartTimeNs = std::max(boundaryStartTimeNs, candidateRange.endTimeNs);
+  }
+  return boundaryStartTimeNs;
+}
+
 std::vector<Context>
 normalizeKernelContextsForLaunchScope(const std::vector<Context> &contexts,
                                       const std::vector<Context> &scopeContexts) {
@@ -1099,9 +1118,11 @@ void reconstructGraphScopeEvents(
       }
       auto &kernelEvent = orderedTraceEvents[record.orderedEventIndex];
       auto &graphScopeRange = graphScopeRanges[*rangeIndex];
+      const auto graphFlowBoundaryStartTimeNs = getGraphFlowBoundaryStartTimeNs(
+          graphScopeRange, record.startTimeNs, graphScopeRanges);
       kernelEvent.explicitClockOffsetNs = graphClockOffsetNs;
       kernelEvent.hasGraphFlowSource = true;
-      kernelEvent.graphFlowStartTimeNs = graphScopeRange.startTimeNs;
+      kernelEvent.graphFlowStartTimeNs = graphFlowBoundaryStartTimeNs;
       kernelEvent.graphFlowEndTimeNs = graphScopeRange.endTimeNs;
       if (kernelEvent.isMetricKernel && record.flexibleMetrics &&
           !record.flexibleMetrics->empty()) {

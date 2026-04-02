@@ -408,6 +408,13 @@ struct OpenGraphScope {
   uint64_t startTimeNs{};
 };
 
+struct GraphScopeBoundary {
+  const OrderedTraceEvent *event{};
+  uint64_t alignedTimeNs{};
+  bool isBegin{};
+  size_t insertionOrder{};
+};
+
 std::string formatFlexibleMetricValue(const MetricValueType &value) {
   return std::visit(
       [](auto &&v) -> std::string {
@@ -1194,10 +1201,32 @@ void dumpKernelMetricTrace(
     }
   }
   uint64_t nextFlowId = 0;
+  auto buildScopeTraceElement = [&](const OrderedTraceEvent &event) {
+    json element;
+    const bool eventHasFlexibleMetrics = hasFlexibleMetrics(event);
+    element["name"] = eventHasFlexibleMetrics
+                          ? buildFlexibleMetricEventName(
+                                event.contexts, *event.getFlexibleMetrics())
+                          : event.contexts.back().name;
+    element["cat"] = eventHasFlexibleMetrics ? "metric" : "scope";
+    if (event.kind == OrderedTraceEvent::Kind::CpuScope) {
+      element["tid"] = getCpuThreadTid(event.threadId);
+      element["args"]["thread_id"] = event.threadId;
+    } else {
+      element["tid"] = getGraphTid(event.streamId);
+    }
+    element["args"]["call_stack"] = buildCallStackJson(event.contexts);
+    if (eventHasFlexibleMetrics) {
+      element["args"]["metrics"] =
+          buildFlexibleMetricsJson(*event.getFlexibleMetrics());
+    }
+    return element;
+  };
   auto appendTraceEvent = [&](const OrderedTraceEvent &event) {
-    if ((event.kind == OrderedTraceEvent::Kind::CpuScope ||
-         event.kind == OrderedTraceEvent::Kind::GraphScope) &&
-        event.contexts.empty()) {
+    if (event.kind == OrderedTraceEvent::Kind::GraphScope) {
+      return;
+    }
+    if (event.kind == OrderedTraceEvent::Kind::CpuScope && event.contexts.empty()) {
       return;
     }
 
@@ -1210,23 +1239,8 @@ void dumpKernelMetricTrace(
       }
       element["cat"] = "kernel";
       element["tid"] = getStreamTid(event.streamId);
-    } else if (event.kind == OrderedTraceEvent::Kind::CpuScope) {
-      const bool eventHasFlexibleMetrics = hasFlexibleMetrics(event);
-      element["name"] = eventHasFlexibleMetrics
-                            ? buildFlexibleMetricEventName(
-                                  event.contexts, *event.getFlexibleMetrics())
-                            : event.contexts.back().name;
-      element["cat"] = eventHasFlexibleMetrics ? "metric" : "scope";
-      element["tid"] = getCpuThreadTid(event.threadId);
-      element["args"]["thread_id"] = event.threadId;
     } else {
-      const bool eventHasFlexibleMetrics = hasFlexibleMetrics(event);
-      element["name"] = eventHasFlexibleMetrics
-                            ? buildFlexibleMetricEventName(
-                                  event.contexts, *event.getFlexibleMetrics())
-                            : event.contexts.back().name;
-      element["cat"] = eventHasFlexibleMetrics ? "metric" : "scope";
-      element["tid"] = getGraphTid(event.streamId);
+      element = buildScopeTraceElement(event);
     }
     const auto alignedStartTimeNs =
         getAlignedStartTimeNs(event, kernelClockOffsetNs);
@@ -1235,11 +1249,6 @@ void dumpKernelMetricTrace(
         static_cast<double>(alignedStartTimeNs - minTimeStamp) / 1000.0;
     element["dur"] =
         static_cast<double>(event.endTimeNs - event.startTimeNs) / 1000.0;
-    element["args"]["call_stack"] = buildCallStackJson(event.contexts);
-    if (hasFlexibleMetrics(event)) {
-      element["args"]["metrics"] =
-          buildFlexibleMetricsJson(*event.getFlexibleMetrics());
-    }
     object["traceEvents"].push_back(element);
     if (event.kind != OrderedTraceEvent::Kind::Kernel) {
       return;
@@ -1306,16 +1315,59 @@ void dumpKernelMetricTrace(
     object["traceEvents"].push_back(flowFinish);
     ++nextFlowId;
   };
+  std::vector<GraphScopeBoundary> graphScopeBoundaries;
+  graphScopeBoundaries.reserve(orderedTraceEvents.size() * 2);
+  size_t nextGraphScopeBoundaryOrder = 0;
+  for (const auto &event : orderedTraceEvents) {
+    if (event.kind != OrderedTraceEvent::Kind::GraphScope || event.contexts.empty()) {
+      continue;
+    }
+    const auto clockOffsetNs = getClockOffsetNs(event, kernelClockOffsetNs);
+    graphScopeBoundaries.push_back(
+        GraphScopeBoundary{&event,
+                           getAlignedTimestampNs(event.startTimeNs, clockOffsetNs),
+                           true,
+                           nextGraphScopeBoundaryOrder++});
+    graphScopeBoundaries.push_back(
+        GraphScopeBoundary{&event,
+                           getAlignedTimestampNs(event.endTimeNs, clockOffsetNs),
+                           false,
+                           nextGraphScopeBoundaryOrder++});
+  }
+  std::sort(graphScopeBoundaries.begin(), graphScopeBoundaries.end(),
+            [](const GraphScopeBoundary &lhs, const GraphScopeBoundary &rhs) {
+              if (lhs.alignedTimeNs != rhs.alignedTimeNs) {
+                return lhs.alignedTimeNs < rhs.alignedTimeNs;
+              }
+              if (lhs.isBegin != rhs.isBegin) {
+                return !lhs.isBegin && rhs.isBegin;
+              }
+              if (lhs.event->contexts.size() != rhs.event->contexts.size()) {
+                if (lhs.isBegin) {
+                  return lhs.event->contexts.size() < rhs.event->contexts.size();
+                }
+                return lhs.event->contexts.size() > rhs.event->contexts.size();
+              }
+              if (lhs.event->contexts != rhs.event->contexts) {
+                return lhs.event->contexts < rhs.event->contexts;
+              }
+              return lhs.insertionOrder < rhs.insertionOrder;
+            });
+  auto appendGraphScopeBoundary = [&](const GraphScopeBoundary &boundary) {
+    json element = buildScopeTraceElement(*boundary.event);
+    element["ph"] = boundary.isBegin ? "B" : "E";
+    element["ts"] =
+        static_cast<double>(boundary.alignedTimeNs - minTimeStamp) / 1000.0;
+    object["traceEvents"].push_back(element);
+  };
 
   for (const auto &event : orderedTraceEvents) {
     if (event.kind == OrderedTraceEvent::Kind::CpuScope) {
       appendTraceEvent(event);
     }
   }
-  for (const auto &event : orderedTraceEvents) {
-    if (event.kind == OrderedTraceEvent::Kind::GraphScope) {
-      appendTraceEvent(event);
-    }
+  for (const auto &boundary : graphScopeBoundaries) {
+    appendGraphScopeBoundary(boundary);
   }
   for (const auto &event : orderedTraceEvents) {
     if (event.kind == OrderedTraceEvent::Kind::Kernel) {

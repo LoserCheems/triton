@@ -964,13 +964,14 @@ uint64_t getAdjustedGraphFlowStartTimeNs(uint64_t alignedGraphScopeStartTimeNs,
                                          uint64_t alignedKernelStartTimeNs) {
   auto latestFlowStartTimeNs =
       std::min(alignedGraphScopeEndTimeNs, alignedKernelStartTimeNs);
-  if (latestFlowStartTimeNs > alignedGraphScopeStartTimeNs) {
-    latestFlowStartTimeNs -= 1;
-  }
   if (latestFlowStartTimeNs < alignedGraphScopeStartTimeNs) {
     return alignedGraphScopeStartTimeNs;
   }
-  return latestFlowStartTimeNs;
+  auto earliestFlowStartTimeNs = alignedGraphScopeStartTimeNs;
+  if (earliestFlowStartTimeNs < latestFlowStartTimeNs) {
+    earliestFlowStartTimeNs += 1;
+  }
+  return std::min(earliestFlowStartTimeNs, latestFlowStartTimeNs);
 }
 
 void reconstructGraphScopeEvents(

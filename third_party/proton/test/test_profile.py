@@ -892,7 +892,7 @@ def test_trace(tmp_path: pathlib.Path, device: str):
     with temp_file.open() as f:
         data = json.load(f)
         trace_events = data["traceEvents"]
-        assert len(trace_events) == 3
+        assert len(trace_events) == 5
         assert trace_events[-1]["name"] == "foo"
         assert trace_events[-1]["args"]["call_stack"] == ["ROOT", "test", "foo"]
 

@@ -733,6 +733,16 @@ void dumpGraphScopeEvents(
                 if (a.timeNs != b.timeNs) {
                   return a.timeNs < b.timeNs;
                 }
+                if (a.isBegin != b.isBegin) {
+                  return a.isBegin && !b.isBegin;
+                }
+                if (a.event->contexts.size() != b.event->contexts.size()) {
+                  if (a.isBegin) {
+                    return a.event->contexts.size() < b.event->contexts.size();
+                  }
+                  return a.event->contexts.size() > b.event->contexts.size();
+                }
+                return a.event->contexts < b.event->contexts;
               });
 
     const auto graphTid = std::string("Graph: Stream ") + std::to_string(streamId);

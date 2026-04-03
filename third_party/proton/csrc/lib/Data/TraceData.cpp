@@ -662,7 +662,23 @@ void reconstructGraphScopeEvents(
       if (!kernelEvent.isGraphLinked)
         continue;
       auto &openScopes = openGraphScopes[streamId];
-      auto &contexts = kernelEvent.contexts;
+      std::vector<Context> graphContexts;
+      bool seenCaptureTag = false;
+      for (const auto &context : kernelEvent.contexts) {
+        if (context.name == GraphState::metricTag ||
+            context.name == GraphState::metadataTag) {
+          break;
+        }
+        if (context.name == GraphState::captureTag) {
+          seenCaptureTag = true;
+        }
+        if (seenCaptureTag) {
+          graphContexts.push_back(context);
+        }
+      }
+      if (!seenCaptureTag) {
+        throw std::runtime_error("Invalid graph contexts without capture tag");
+      }
       auto startTimeNs = std::get<uint64_t>(
           kernelEvent.kernelMetric->getValue(KernelMetric::StartTime));
       auto endTimeNs = std::get<uint64_t>(
@@ -671,54 +687,33 @@ void reconstructGraphScopeEvents(
       // on common context prefix
       if (openScopes.empty()) {
         // There's no open graph scope, we start a new stack of scopes
-        bool seenCaptureTag = false;
-        for (const auto &context : contexts) {
-          if (context.name == GraphState::captureTag) {
-            seenCaptureTag = true;
-          } else if (context.name == GraphState::metricTag ||
-                     context.name == GraphState::metadataTag) {
-            break;
-          }
-          if (seenCaptureTag) {
-            openScopes.push_back({context, startTimeNs});
-          }
+        for (const auto &context : graphContexts) {
+          openScopes.push_back({context, startTimeNs});
         }
       } else {
         auto numCommonPrefixes = 0;
-        auto captureTagIdx = -1;
-        for (size_t i = 0; i < openScopes.size(); ++i) {
-          if (openScopes[i].context.name == GraphState::captureTag) {
-            captureTagIdx = i;
+        while (numCommonPrefixes < openScopes.size() &&
+               numCommonPrefixes < graphContexts.size()) {
+          if (openScopes[numCommonPrefixes].context !=
+              graphContexts[numCommonPrefixes]) {
             break;
           }
-        }
-        if (captureTagIdx == -1)
-          throw std::runtime_error("Invalid open graph scope without capture tag");
-        for (size_t i = 0; i < openScopes.size(); ++i) {
-          if (openScopes[i].context != contexts[i + captureTagIdx] ||
-              i + captureTagIdx >= contexts.size())
-            break;
           numCommonPrefixes++;
         }
-        for (size_t i = numCommonPrefixes; i < openScopes.size(); ++i) {
+        for (size_t i = openScopes.size(); i > numCommonPrefixes; --i) {
           // Close scopes that are not in the common prefix
-          auto &tailOpenScope = openScopes[i];
+          auto &tailOpenScope = openScopes[i - 1];
           graphScopeEvents[streamId].push_back(
               {tailOpenScope.context, streamId,
                tailOpenScope.startTimeNs, lastEndTimeNs});
         }
-        for (size_t i = numCommonPrefixes; i < openScopes.size(); ++i) {
+        for (size_t i = openScopes.size(); i > numCommonPrefixes; --i) {
           // Remove scopes that are not in the common prefix
           openScopes.pop_back();
         }
-        for (size_t i = numCommonPrefixes + captureTagIdx; i < contexts.size();
-             ++i) {
+        for (size_t i = numCommonPrefixes; i < graphContexts.size(); ++i) {
           // Open scopes that are not in the common prefix
-          const auto &context = contexts[i];
-          if (context.name == GraphState::metricTag ||
-              context.name == GraphState::metadataTag) {
-            break;
-          }
+          const auto &context = graphContexts[i];
           openScopes.push_back({context, startTimeNs});
         }
       }

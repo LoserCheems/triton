@@ -59,11 +59,14 @@ public:
   // makes the reshape a "nop", i.e. the same GPU threads contain the same
   // elements as before the reshape using legacy layouts.  This is not always
   // possible (in which case we fallback to using LinearLayouts)
+  // If allowReorder is set, an existing value in dstEnc is preferred when it
+  // still yields a non-expensive view.
   // In the future we'll always use LinearLayouts
   virtual LogicalResult
   inferReshapeOpEncoding(ArrayRef<int64_t> srcShape, Attribute srcEnc,
                          ArrayRef<int64_t> dstShape, Attribute &dstEnc,
-                         std::optional<Location> loc) const = 0;
+                         std::optional<Location> loc,
+                         bool allowReorder = false) const = 0;
 
   // Verify that a view between the two types can be implemented without data
   // movement.

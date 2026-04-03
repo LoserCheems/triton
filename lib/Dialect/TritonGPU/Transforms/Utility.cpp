@@ -462,18 +462,14 @@ static Attribute inferSrcEncoding(triton::TransposeOpInterface op,
 static Attribute inferReshapeOpDstEncoding(ArrayRef<int64_t> srcShape,
                                            Attribute srcEnc,
                                            ArrayRef<int64_t> dstShape,
-                                           bool allowReorder) {
-  // We don't do anything smart to allow-reorder reshapes here.  They are
-  // handled in OptimizeThreadLocality.
-  if (allowReorder)
-    return {};
-
-  Attribute dstEnc;
+                                           Attribute dstEncHint = {},
+                                           bool allowReorder = false) {
+  Attribute dstEnc = dstEncHint;
   auto result =
       srcEnc.getDialect()
           .getRegisteredInterface<triton::DialectInferLayoutInterface>()
           ->inferReshapeOpEncoding(srcShape, srcEnc, dstShape, dstEnc,
-                                   /*loc=*/std::nullopt);
+                                   /*loc=*/std::nullopt, allowReorder);
   assert(succeeded(result));
   return dstEnc;
 }
@@ -481,6 +477,7 @@ static Attribute inferReshapeOpDstEncoding(ArrayRef<int64_t> srcShape,
 static Attribute inferDstEncoding(triton::ReshapeOp op, Attribute encoding) {
   return inferReshapeOpDstEncoding(op.getSrc().getType().getShape(), encoding,
                                    op.getType().getShape(),
+                                   op.getType().getEncoding(),
                                    op.getAllowReorder());
 }
 
@@ -498,6 +495,7 @@ static Attribute inferSrcEncoding(triton::ReshapeOp op, Attribute encoding) {
   // way.
   return inferReshapeOpDstEncoding(op.getType().getShape(), encoding,
                                    op.getSrc().getType().getShape(),
+                                   op.getSrc().getType().getEncoding(),
                                    op.getAllowReorder());
 }
 

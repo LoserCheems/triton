@@ -3290,13 +3290,25 @@ struct TritonGPUInferLayoutInterface
     return success();
   }
 
-  LogicalResult
-  inferReshapeOpEncoding(ArrayRef<int64_t> srcShape, Attribute srcEnc,
-                         ArrayRef<int64_t> dstShape, Attribute &dstEnc,
-                         std::optional<Location> loc) const override {
+  LogicalResult inferReshapeOpEncoding(ArrayRef<int64_t> srcShape,
+                                       Attribute srcEnc,
+                                       ArrayRef<int64_t> dstShape,
+                                       Attribute &dstEnc,
+                                       std::optional<Location> loc,
+                                       bool allowReorder) const override {
     if (product(srcShape) != product(dstShape)) {
       return emitOptionalError(loc, "numel of dst shape does not match "
                                     "numel of src shape");
+    }
+    // If allowReorder is true, there are multiple valid encodings, prefer the
+    // hint if it is set and valid.
+    if (allowReorder && dstEnc) {
+      auto ctx = srcEnc.getContext();
+      auto elemType = IntegerType::get(ctx, 32, IntegerType::Unsigned);
+      auto srcType = RankedTensorType::get(srcShape, elemType, srcEnc);
+      auto dstType = RankedTensorType::get(dstShape, elemType, dstEnc);
+      if (!isExpensiveView(srcType, dstType))
+        return success();
     }
     auto result =
         inferReshapeOpLegacyEncoding(srcShape, srcEnc, dstShape, dstEnc);

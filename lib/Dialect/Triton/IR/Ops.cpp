@@ -852,7 +852,8 @@ void ReshapeOp::build(OpBuilder &builder, OperationState &state,
   if (srcEnc) {
     auto result = cast<DialectInferLayoutInterface>(&srcEnc.getDialect())
                       ->inferReshapeOpEncoding(srcTy.getShape(), srcEnc, shape,
-                                               dstEnc, state.location);
+                                               dstEnc, state.location,
+                                               allowReorder);
     assert(succeeded(result));
   }
   auto dstTy = RankedTensorType::get(shape, srcTy.getElementType(), dstEnc);

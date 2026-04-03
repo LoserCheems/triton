@@ -53,9 +53,9 @@ public:
     friend class Trace;
   };
 
-  struct TraceEvent {
-    TraceEvent() = default;
-    TraceEvent(size_t id, size_t contextId, size_t parentEventId)
+  struct Event {
+    Event() = default;
+    Event(size_t id, size_t contextId, size_t parentEventId)
         : id(id), contextId(contextId), parentEventId(parentEventId) {}
     size_t id = 0;
     size_t scopeId = Scope::DummyScopeId;
@@ -124,8 +124,7 @@ public:
     return contexts;
   }
 
-  size_t addEvent(size_t contextId,
-                  size_t parentEventId = TraceEvent::DummyId) {
+  size_t addEvent(size_t contextId, size_t parentEventId = Event::DummyId) {
     traceEvents.try_emplace(nextEventId, nextEventId, contextId, parentEventId);
     return nextEventId++;
   }
@@ -134,7 +133,7 @@ public:
     return traceEvents.find(eventId) != traceEvents.end();
   }
 
-  TraceEvent &getEvent(size_t eventId) {
+  Event &getEvent(size_t eventId) {
     auto it = traceEvents.find(eventId);
     if (it == traceEvents.end()) {
       throw std::runtime_error("Event not found");
@@ -144,12 +143,12 @@ public:
 
   void removeEvent(size_t eventId) { traceEvents.erase(eventId); }
 
-  const std::map<size_t, TraceEvent> &getEvents() const { return traceEvents; }
+  const std::map<size_t, Event> &getEvents() const { return traceEvents; }
 
 private:
   size_t nextTreeContextId = TraceContext::RootId + 1;
   size_t nextEventId = 0;
-  std::map<size_t, TraceEvent> traceEvents;
+  std::map<size_t, Event> traceEvents;
   // tree node id -> trace context
   std::map<size_t, TraceContext> traceContextMap;
 };
@@ -158,7 +157,7 @@ thread_local std::unordered_map<const TraceData *, std::vector<size_t>>
     traceDataToActiveEventStack;
 
 uint64_t getCurrentCpuTimestampNs() {
-  using Clock = std::chrono::steady_clock;
+  using Clock = std::chrono::system_clock;
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              Clock::now().time_since_epoch())
       .count();
@@ -174,8 +173,9 @@ void TraceData::enterScope(const Scope &scope) {
   else
     contexts.push_back(scope.name);
   auto &activeEventStack = traceDataToActiveEventStack[this];
-  size_t parentEventId = activeEventStack.empty() ? Trace::TraceEvent::DummyId
-                                                  : activeEventStack.back();
+  size_t parentEventId =
+      activeEventStack.empty() ? Trace::Event::DummyId
+                               : activeEventStack.back();
   auto eventId =
       currentTrace->addEvent(currentTrace->addContexts(contexts), parentEventId);
   auto &event = currentTrace->getEvent(eventId);
@@ -214,7 +214,7 @@ DataEntry TraceData::addOp(size_t phase, size_t eventId,
     parentContextId = event.contextId;
   }
   const auto contextId = trace->addContexts(contexts, parentContextId);
-  size_t parentEventId = Trace::TraceEvent::DummyId;
+  size_t parentEventId = Trace::Event::DummyId;
   if (eventId == Data::kRootEntryId) {
     auto activeEventStackIt = traceDataToActiveEventStack.find(this);
     if (activeEventStackIt != traceDataToActiveEventStack.end() &&
@@ -325,88 +325,6 @@ struct GraphScopeEvent {
   uint64_t startTimeNs{};
   uint64_t endTimeNs{};
   const DataEntry::FlexibleMetricMap *flexibleMetrics{};
-};
-
-struct TraceEvent {
-  enum class Kind { Kernel, CpuScope, GraphScope };
-
-  Kind kind;
-  const KernelMetric *kernelMetric{};
-  const DataEntry::FlexibleMetricMap *flexibleMetrics{};
-  std::shared_ptr<DataEntry::FlexibleMetricMap> flexibleMetricsStorage;
-  std::vector<Context> contexts;
-  size_t owningEventId = TraceData::Trace::TraceEvent::DummyId;
-  size_t launchScopeEventId = TraceData::Trace::TraceEvent::DummyId;
-  size_t threadId = 0;
-  size_t streamId = 0;
-  uint64_t startTimeNs = 0;
-  uint64_t endTimeNs = 0;
-  bool isGraphLinked = false;
-  bool isMetricKernel = false;
-  bool hasGraphFlowSource = false;
-  uint64_t graphFlowStartTimeNs = 0;
-  uint64_t graphFlowEndTimeNs = 0;
-  std::optional<int64_t> explicitClockOffsetNs;
-
-  const DataEntry::FlexibleMetricMap *getFlexibleMetrics() const {
-    return flexibleMetricsStorage ? flexibleMetricsStorage.get()
-                                  : flexibleMetrics;
-  }
-
-  static TraceEvent kernel(const KernelMetric *metric,
-                           const DataEntry::FlexibleMetricMap *metrics,
-                           std::vector<Context> contexts, size_t owningEventId,
-                           size_t streamId, size_t launchScopeEventId,
-                           bool isGraphLinked, bool isMetricKernel) {
-    TraceEvent event;
-    event.kind = Kind::Kernel;
-    event.kernelMetric = metric;
-    event.flexibleMetrics = metrics;
-    event.contexts = std::move(contexts);
-    event.owningEventId = owningEventId;
-    event.launchScopeEventId = launchScopeEventId;
-    event.streamId = streamId;
-    event.startTimeNs =
-        std::get<uint64_t>(metric->getValue(KernelMetric::StartTime));
-    event.endTimeNs =
-        std::get<uint64_t>(metric->getValue(KernelMetric::EndTime));
-    event.isGraphLinked = isGraphLinked;
-    event.isMetricKernel = isMetricKernel;
-    return event;
-  }
-
-  static TraceEvent cpuScope(
-      const DataEntry::FlexibleMetricMap *metrics, std::vector<Context> contexts,
-      size_t threadId, uint64_t startTimeNs, uint64_t endTimeNs) {
-    TraceEvent event;
-    event.kind = Kind::CpuScope;
-    event.flexibleMetrics = metrics;
-    event.contexts = std::move(contexts);
-    event.threadId = threadId;
-    event.startTimeNs = startTimeNs;
-    event.endTimeNs = endTimeNs;
-    return event;
-  }
-
-  static TraceEvent graphScope(
-      std::vector<Context> contexts, size_t streamId, uint64_t startTimeNs,
-      uint64_t endTimeNs,
-      std::shared_ptr<DataEntry::FlexibleMetricMap> flexibleMetricsStorage =
-          nullptr,
-      std::optional<int64_t> explicitClockOffsetNs = std::nullopt) {
-    TraceEvent event;
-    event.kind = Kind::GraphScope;
-    event.contexts = std::move(contexts);
-    event.streamId = streamId;
-    event.startTimeNs = startTimeNs;
-    event.endTimeNs = endTimeNs;
-    event.flexibleMetricsStorage = std::move(flexibleMetricsStorage);
-    event.explicitClockOffsetNs = explicitClockOffsetNs;
-    event.flexibleMetrics = event.flexibleMetricsStorage
-                                ? event.flexibleMetricsStorage.get()
-                                : nullptr;
-    return event;
-  }
 };
 
 std::vector<KernelTrace>

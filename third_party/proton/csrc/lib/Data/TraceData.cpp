@@ -770,61 +770,26 @@ void dumpGraphScopeEvents(
     uint64_t minTimeStamp,
     std::map<size_t, std::vector<GraphScopeEvent>> &graphScopeEvents,
     json &object, std::ostream &os) {
-  struct Boundary {
-    const GraphScopeEvent *event{};
-    uint64_t timeNs{};
-    bool isBegin{};
-  };
-
   for (auto &[streamId, events] : graphScopeEvents) {
-    std::vector<Boundary> boundaries;
-    boundaries.reserve(events.size() * 2);
-    for (const auto &event : events) {
-      if (event.contexts.empty()) {
-        continue;
-      }
-      boundaries.push_back({&event, event.startTimeNs, true});
-      boundaries.push_back({&event, event.endTimeNs, false});
-    }
-
-    std::sort(boundaries.begin(), boundaries.end(),
-              [](const Boundary &a, const Boundary &b) {
-                if (a.timeNs != b.timeNs) {
-                  return a.timeNs < b.timeNs;
-                }
-                if (a.isBegin != b.isBegin) {
-                  return a.isBegin && !b.isBegin;
-                }
-                if (a.event->contexts.size() != b.event->contexts.size()) {
-                  if (a.isBegin) {
-                    return a.event->contexts.size() < b.event->contexts.size();
-                  }
-                  return a.event->contexts.size() > b.event->contexts.size();
-                }
-                return a.event->contexts < b.event->contexts;
-              });
-
     const auto graphTid = getGraphLaneId(streamId);
-    for (const auto &boundary : boundaries) {
+    for (const auto &event : events) {
       json element;
-      if (boundary.event->flexibleMetrics != nullptr &&
-          !boundary.event->flexibleMetrics->empty()) {
+      if (event.flexibleMetrics != nullptr && !event.flexibleMetrics->empty()) {
         element["name"] = buildFlexibleMetricEventName(
-            boundary.event->contexts, *boundary.event->flexibleMetrics);
+            event.contexts, *event.flexibleMetrics);
         element["cat"] = "metric";
-        element["args"]["metrics"] =
-            buildFlexibleMetricsJson(*boundary.event->flexibleMetrics);
+        element["args"]["metrics"] = buildFlexibleMetricsJson(*event.flexibleMetrics);
       } else {
-        element["name"] = boundary.event->contexts.back().name;
+        element["name"] = event.contexts.back().name;
         element["cat"] = "scope";
       }
-      element["ph"] = boundary.isBegin ? "B" : "E";
+      element["ph"] = "X";
       element["pid"] = kTraceProcessId;
-      element["ts"] =
-          static_cast<double>(boundary.timeNs - minTimeStamp) / 1000.0;
+      element["ts"] = static_cast<double>(event.startTimeNs - minTimeStamp) / 1000.0;
+      element["dur"] =
+          static_cast<double>(event.endTimeNs - event.startTimeNs) / 1000.0;
       element["tid"] = graphTid;
-      element["args"]["call_stack"] =
-          buildCallStackJson(boundary.event->contexts);
+      element["args"]["call_stack"] = buildCallStackJson(event.contexts);
       object["traceEvents"].push_back(std::move(element));
     }
   }

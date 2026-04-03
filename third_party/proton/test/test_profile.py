@@ -1095,25 +1095,20 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
     assert replay_graph_events
     graph_tid = replay_graph_events[0]["tid"]
     assert all(event["tid"] == graph_tid for event in replay_graph_events)
-    assert all(event["ph"] in ("B", "E") for event in replay_graph_events)
+    assert all(event["ph"] == "X" for event in replay_graph_events)
     assert all("<captured_at>" not in get_call_stack(event) for event in replay_graph_events)
     assert all(COMPUTE_METADATA_SCOPE_NAME not in get_call_stack(event) for event in replay_graph_events)
 
     def get_graph_scope(expected_stack):
-        begin_event = next(
-            event for event in replay_graph_events
-            if event["ph"] == "B" and has_stack(event, expected_stack)
-        )
-        end_event = next(
-            event for event in replay_graph_events
-            if event["ph"] == "E" and has_stack(event, expected_stack)
+        event = next(
+            event for event in replay_graph_events if has_stack(event, expected_stack)
         )
         return {
-            "name": begin_event["name"],
-            "cat": begin_event["cat"],
-            "ts": begin_event["ts"],
-            "dur": end_event["ts"] - begin_event["ts"],
-            "args": begin_event.get("args", {}),
+            "name": event["name"],
+            "cat": event["cat"],
+            "ts": event["ts"],
+            "dur": event["dur"],
+            "args": event.get("args", {}),
         }
 
     scope_a = get_graph_scope(["ROOT", "test0", "a"])
@@ -1225,25 +1220,20 @@ def test_trace_cudagraph_metric_only_scope_path(tmp_path: pathlib.Path, device: 
     ]
     assert replay_graph_events
     graph_tid = replay_graph_events[0]["tid"]
-    assert all(event["ph"] in ("B", "E") for event in replay_graph_events)
+    assert all(event["ph"] == "X" for event in replay_graph_events)
     assert all("<captured_at>" not in get_call_stack(event) for event in replay_graph_events)
     assert all(COMPUTE_METADATA_SCOPE_NAME not in get_call_stack(event) for event in replay_graph_events)
 
     def get_graph_scope(expected_stack):
-        begin_event = next(
-            event for event in replay_graph_events
-            if event["ph"] == "B" and has_stack(event, expected_stack)
-        )
-        end_event = next(
-            event for event in replay_graph_events
-            if event["ph"] == "E" and has_stack(event, expected_stack)
+        event = next(
+            event for event in replay_graph_events if has_stack(event, expected_stack)
         )
         return {
-            "name": begin_event["name"],
-            "cat": begin_event["cat"],
-            "ts": begin_event["ts"],
-            "dur": end_event["ts"] - begin_event["ts"],
-            "args": begin_event.get("args", {}),
+            "name": event["name"],
+            "cat": event["cat"],
+            "ts": event["ts"],
+            "dur": event["dur"],
+            "args": event.get("args", {}),
         }
 
     outer_event = get_graph_scope(["ROOT", "test0", "outer"])

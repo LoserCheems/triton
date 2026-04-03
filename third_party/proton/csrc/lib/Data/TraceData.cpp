@@ -664,9 +664,11 @@ void reconstructGraphScopeEvents(
       auto &openScopes = openGraphScopes[streamId];
       std::vector<Context> graphContexts;
       bool seenCaptureTag = false;
+      bool isMetadataKernel = false;
       for (const auto &context : kernelEvent.contexts) {
         if (context.name == GraphState::metricTag ||
             context.name == GraphState::metadataTag) {
+          isMetadataKernel = true;
           break;
         }
         if (context.name == GraphState::captureTag) {
@@ -678,6 +680,10 @@ void reconstructGraphScopeEvents(
       }
       if (!seenCaptureTag) {
         throw std::runtime_error("Invalid graph contexts without capture tag");
+      }
+      if (!isMetadataKernel) {
+        graphContexts
+            .pop_back(); // Remove kernel name context for non-metadata kernels
       }
       auto startTimeNs = std::get<uint64_t>(
           kernelEvent.kernelMetric->getValue(KernelMetric::StartTime));

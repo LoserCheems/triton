@@ -275,14 +275,6 @@ std::vector<uint8_t> TraceData::toMsgPack(size_t phase) const {
 
 namespace {
 
-
-constexpr const char *kCpuThreadTidPrefix = "cpu thread ";
-constexpr const char *kLaunchFlowName = "launch->kernel";
-constexpr const char *kLaunchFlowCategory = "flow";
-constexpr const char *kComputeMetadataScopeName = "__proton_launch_metadata";
-
-typedef std::unordered_map<size_t, std::vector<Context>> contextIdToContextsMap;
-
 // Structure to pair CycleMetric with its context for processing
 struct CycleEvent {
   std::vector<Context> contexts;
@@ -659,7 +651,7 @@ void dumpKernelEvents(
       element["ph"] = "X";
       element["ts"] = ts;
       element["dur"] = dur;
-      element["tid"] = streamId; // thread id = stream
+      element["tid"] = "GPU Stream " + std::to_string(streamId); // thread id = stream
       element["args"]["call_stack"] = buildCallStackJson(contexts);
       if (flexibleMetrics) {
         element["args"]["metrics"] = buildFlexibleMetricsJson(*flexibleMetrics);
@@ -695,7 +687,7 @@ void dumpCpuScopeEvents(
       element["ph"] = "X";
       element["ts"] = ts;
       element["dur"] = dur;
-      element["tid"] = std::string(kCpuThreadTidPrefix) + std::to_string(threadId);
+      element["tid"] = "CPU Thread " + std::to_string(threadId);
       element["args"]["call_stack"] = buildCallStackJson(event.contexts);
       object["traceEvents"].push_back(std::move(element));
     }

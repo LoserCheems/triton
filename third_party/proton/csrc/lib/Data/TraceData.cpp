@@ -777,11 +777,6 @@ void dumpGraphScopeEvents(
   };
 
   for (auto &[streamId, events] : graphScopeEvents) {
-    std::sort(events.begin(), events.end(),
-              [](const GraphScopeEvent &a, const GraphScopeEvent &b) {
-                return a.startTimeNs < b.startTimeNs;
-              });
-
     std::vector<Boundary> boundaries;
     boundaries.reserve(events.size() * 2);
     for (const auto &event : events) {

@@ -17,6 +17,10 @@ using json = nlohmann::json;
 
 namespace proton {
 
+namespace {
+inline constexpr size_t kMaxActiveEventStackCacheObjects = 10;
+}
+
 class TraceData::Trace {
 public:
   struct TraceContext : public Context {
@@ -55,18 +59,19 @@ public:
     size_t id = 0;
     size_t scopeId = Scope::DummyScopeId;
     size_t contextId = TraceContext::DummyId;
+    // When the current event is added to the trace,
+    // what is the parent event that is active (i.e. the last one entered but
+    // not yet exited) in the trace
     size_t parentEventId = DummyId;
-    size_t launchScopeEventId = DummyId;
     uint64_t cpuStartTimeNs = 0;
     uint64_t cpuEndTimeNs = 0;
-    uint64_t threadId = 0;
-    bool hasCpuStartTime = false;
-    bool hasCpuEndTime = false;
+    size_t threadId = 0;
     // Direct and linked metrics emitted for this trace event.
     DataEntry::MetricSet metricSet{};
 
     bool hasCpuTimeRange() const {
-      return hasCpuStartTime && hasCpuEndTime && cpuEndTimeNs >= cpuStartTimeNs;
+      return cpuStartTimeNs != 0 && cpuEndTimeNs != 0 &&
+             cpuEndTimeNs >= cpuStartTimeNs;
     }
 
     const static inline size_t DummyId = std::numeric_limits<size_t>::max();
@@ -174,9 +179,7 @@ void TraceData::enterScope(const Scope &scope) {
       currentTrace->addEvent(currentTrace->addContexts(contexts), parentEventId);
   auto &event = currentTrace->getEvent(eventId);
   event.scopeId = scope.scopeId;
-  event.launchScopeEventId = eventId;
   event.cpuStartTimeNs = getCurrentCpuTimestampNs();
-  event.hasCpuStartTime = true;
   event.threadId = getCurrentThreadTraceId();
   scopeIdToEventId[scope.scopeId] = eventId;
   activeEventStack.push_back(eventId);
@@ -189,15 +192,11 @@ void TraceData::exitScope(const Scope &scope) {
     auto *currentTrace = currentPhasePtrAs<Trace>();
     auto &event = currentTrace->getEvent(scopeEventIt->second);
     event.cpuEndTimeNs = getCurrentCpuTimestampNs();
-    event.hasCpuEndTime = true;
     auto &activeEventStack = traceDataToActiveEventStack[this];
-    if (!activeEventStack.empty() &&
-        activeEventStack.back() == scopeEventIt->second) {
-      activeEventStack.pop_back();
-      if (activeEventStack.empty()) {
-        traceDataToActiveEventStack.erase(this);
-      }
-    }
+    activeEventStack.pop_back();
+    if (activeEventStack.empty() &&
+        traceDataToActiveEventStack.size() > kMaxActiveEventStackCacheObjects)
+      traceDataToActiveEventStack.erase(this);
   }
   scopeIdToEventId.erase(scope.scopeId);
 }
@@ -214,28 +213,20 @@ DataEntry TraceData::addOp(size_t phase, size_t eventId,
     parentContextId = event.contextId;
   }
   const auto contextId = trace->addContexts(contexts, parentContextId);
-  const auto newEventId = trace->addEvent(contextId);
-  auto &newEvent = trace->getEvent(newEventId);
+  size_t parentEventId = Trace::TraceEvent::DummyId;
   if (eventId == Data::kRootEntryId) {
-    newEvent.cpuStartTimeNs = getCurrentCpuTimestampNs();
-    newEvent.hasCpuStartTime = true;
-    newEvent.threadId = getCurrentThreadTraceId();
     auto activeEventStackIt = traceDataToActiveEventStack.find(this);
     if (activeEventStackIt != traceDataToActiveEventStack.end() &&
         !activeEventStackIt->second.empty()) {
-      newEvent.launchScopeEventId = activeEventStackIt->second.back();
+      parentEventId = activeEventStackIt->second.back();
     }
   } else {
-    const auto &parentEvent = trace->getEvent(eventId);
-    if (parentEvent.scopeId != Scope::DummyScopeId) {
-      newEvent.launchScopeEventId = eventId;
-    } else {
-      newEvent.launchScopeEventId = parentEvent.launchScopeEventId;
-    }
-    newEvent.cpuStartTimeNs = parentEvent.cpuStartTimeNs;
-    newEvent.hasCpuStartTime = parentEvent.hasCpuStartTime;
-    newEvent.threadId = parentEvent.threadId;
+    parentEventId = eventId;
   }
+  const auto newEventId = trace->addEvent(contextId, parentEventId);
+  auto &newEvent = trace->getEvent(newEventId);
+  // This is an instant or a GPU event, no CPU time range
+  newEvent.threadId = getCurrentThreadTraceId();
   return DataEntry(newEventId, phase, newEvent.metricSet);
 }
 
@@ -256,7 +247,7 @@ void TraceData::addMetrics(
   }
 }
 
-uint64_t TraceData::getCurrentThreadTraceId() {
+size_t TraceData::getCurrentThreadTraceId() {
   auto threadId = std::this_thread::get_id();
   auto it = threadIdToTraceId.find(threadId);
   if (it != threadIdToTraceId.end()) {
@@ -283,22 +274,59 @@ std::vector<uint8_t> TraceData::toMsgPack(size_t phase) const {
 
 namespace {
 
-// Structure to pair CycleMetric with its context for processing
-struct CycleMetricWithContext {
-  const CycleMetric *cycleMetric;
-  // Full call path captured for this cycle metric event.
-  std::vector<Context> contexts;
-
-  CycleMetricWithContext(const CycleMetric *metric, std::vector<Context> ctx)
-      : cycleMetric(metric), contexts(std::move(ctx)) {}
-};
 
 constexpr const char *kCpuThreadTidPrefix = "cpu thread ";
 constexpr const char *kLaunchFlowName = "launch->kernel";
 constexpr const char *kLaunchFlowCategory = "flow";
 constexpr const char *kComputeMetadataScopeName = "__proton_launch_metadata";
 
-struct OrderedTraceEvent {
+typedef std::unordered_map<size_t, std::vector<Context>> contextIdToContextsMap;
+
+// Structure to pair CycleMetric with its context for processing
+struct CycleEvent {
+  std::vector<Context> contexts;
+  const CycleMetric *cycleMetric;
+
+  CycleEvent(const CycleMetric *metric, std::vector<Context> contexts)
+      : contexts(std::move(contexts)), cycleMetric(metric) {}
+};
+
+struct KernelEvent {
+  const KernelMetric *kernelMetric{};
+  const DataEntry::FlexibleMetricMap *flexibleMetrics{};
+  std::vector<Context> contexts;
+  size_t launchEventId{};
+  bool isGraphLinked{};
+
+  KernelEvent(const KernelMetric *metric, const DataEntry::FlexibleMetricMap *metrics,
+              std::vector<Context> contexts, size_t launchId, bool isGraphLinked)
+      : kernelMetric(metric), flexibleMetrics(metrics), contexts(std::move(contexts)),
+        launchEventId(launchId), isGraphLinked(isGraphLinked) {}
+};
+
+struct CpuScopeEvent {
+  std::vector<Context> contexts;
+  size_t threadId;
+  uint64_t startTimeNs;
+  uint64_t endTimeNs;
+  const DataEntry::FlexibleMetricMap *flexibleMetrics{};
+
+  CpuScopeEvent(const DataEntry::FlexibleMetricMap *metrics,
+                std::vector<Context> contexts, size_t tid, uint64_t start,
+                uint64_t end)
+      : contexts(std::move(contexts)), threadId(tid), startTimeNs(start),
+        endTimeNs(end), flexibleMetrics(metrics) {}
+};
+
+struct GraphScopeEvent {
+  std::vector<Context> contexts;
+  size_t streamId{};
+  uint64_t startTimeNs{};
+  uint64_t endTimeNs{};
+  const DataEntry::FlexibleMetricMap *flexibleMetrics{};
+};
+
+struct TraceEvent {
   enum class Kind { Kernel, CpuScope, GraphScope };
 
   Kind kind;
@@ -308,13 +336,12 @@ struct OrderedTraceEvent {
   std::vector<Context> contexts;
   size_t owningEventId = TraceData::Trace::TraceEvent::DummyId;
   size_t launchScopeEventId = TraceData::Trace::TraceEvent::DummyId;
-  uint64_t threadId = 0;
+  size_t threadId = 0;
   size_t streamId = 0;
   uint64_t startTimeNs = 0;
   uint64_t endTimeNs = 0;
   bool isGraphLinked = false;
   bool isMetricKernel = false;
-  size_t graphScopeStartIndex = 0;
   bool hasGraphFlowSource = false;
   uint64_t graphFlowStartTimeNs = 0;
   uint64_t graphFlowEndTimeNs = 0;
@@ -325,14 +352,12 @@ struct OrderedTraceEvent {
                                   : flexibleMetrics;
   }
 
-  static OrderedTraceEvent kernel(const KernelMetric *metric,
-                                  const DataEntry::FlexibleMetricMap *metrics,
-                                  std::vector<Context> contexts,
-                                  size_t owningEventId, size_t streamId,
-                                  size_t launchScopeEventId,
-                                  bool isGraphLinked, bool isMetricKernel,
-                                  size_t graphScopeStartIndex) {
-    OrderedTraceEvent event;
+  static TraceEvent kernel(const KernelMetric *metric,
+                           const DataEntry::FlexibleMetricMap *metrics,
+                           std::vector<Context> contexts, size_t owningEventId,
+                           size_t streamId, size_t launchScopeEventId,
+                           bool isGraphLinked, bool isMetricKernel) {
+    TraceEvent event;
     event.kind = Kind::Kernel;
     event.kernelMetric = metric;
     event.flexibleMetrics = metrics;
@@ -346,14 +371,13 @@ struct OrderedTraceEvent {
         std::get<uint64_t>(metric->getValue(KernelMetric::EndTime));
     event.isGraphLinked = isGraphLinked;
     event.isMetricKernel = isMetricKernel;
-    event.graphScopeStartIndex = graphScopeStartIndex;
     return event;
   }
 
-  static OrderedTraceEvent cpuScope(
+  static TraceEvent cpuScope(
       const DataEntry::FlexibleMetricMap *metrics, std::vector<Context> contexts,
-      uint64_t threadId, uint64_t startTimeNs, uint64_t endTimeNs) {
-    OrderedTraceEvent event;
+      size_t threadId, uint64_t startTimeNs, uint64_t endTimeNs) {
+    TraceEvent event;
     event.kind = Kind::CpuScope;
     event.flexibleMetrics = metrics;
     event.contexts = std::move(contexts);
@@ -363,13 +387,13 @@ struct OrderedTraceEvent {
     return event;
   }
 
-  static OrderedTraceEvent graphScope(
+  static TraceEvent graphScope(
       std::vector<Context> contexts, size_t streamId, uint64_t startTimeNs,
       uint64_t endTimeNs,
       std::shared_ptr<DataEntry::FlexibleMetricMap> flexibleMetricsStorage =
           nullptr,
       std::optional<int64_t> explicitClockOffsetNs = std::nullopt) {
-    OrderedTraceEvent event;
+    TraceEvent event;
     event.kind = Kind::GraphScope;
     event.contexts = std::move(contexts);
     event.streamId = streamId;
@@ -384,122 +408,8 @@ struct OrderedTraceEvent {
   }
 };
 
-struct GraphKernelRecord {
-  size_t orderedEventIndex{};
-  size_t owningEventId{};
-  size_t streamId{};
-  uint64_t startTimeNs{};
-  uint64_t endTimeNs{};
-  size_t scopeStartIndex{};
-  std::vector<Context> scopeContexts;
-  const DataEntry::FlexibleMetricMap *flexibleMetrics{};
-};
-
-struct GraphScopeRange {
-  std::vector<Context> contexts;
-  size_t streamId{};
-  uint64_t startTimeNs{};
-  uint64_t endTimeNs{};
-  DataEntry::FlexibleMetricMap flexibleMetrics{};
-};
-
-struct OpenGraphScope {
-  std::vector<Context> contexts;
-  uint64_t startTimeNs{};
-};
-
-struct GraphScopeBoundary {
-  const OrderedTraceEvent *event{};
-  uint64_t alignedTimeNs{};
-  bool isBegin{};
-  size_t insertionOrder{};
-};
-
-std::string formatFlexibleMetricValue(const MetricValueType &value) {
-  return std::visit(
-      [](auto &&v) -> std::string {
-        using T = std::decay_t<decltype(v)>;
-        if constexpr (std::is_same_v<T, uint64_t> || std::is_same_v<T, int64_t> ||
-                      std::is_same_v<T, double>) {
-          return std::to_string(v);
-        } else if constexpr (std::is_same_v<T, std::string>) {
-          return v;
-        } else if constexpr (std::is_same_v<T, std::vector<uint64_t>> ||
-                             std::is_same_v<T, std::vector<int64_t>> ||
-                             std::is_same_v<T, std::vector<double>>) {
-          std::ostringstream ss;
-          ss << "[";
-          for (size_t i = 0; i < v.size(); ++i) {
-            if (i != 0) {
-              ss << ",";
-            }
-            ss << v[i];
-          }
-          ss << "]";
-          return ss.str();
-        } else {
-          static_assert(sizeof(T) == 0, "Unsupported MetricValueType");
-        }
-      },
-      value);
-}
-
-bool hasFlexibleMetrics(const OrderedTraceEvent &event) {
-  const auto *flexibleMetrics = event.getFlexibleMetrics();
-  return flexibleMetrics != nullptr && !flexibleMetrics->empty();
-}
-
-json buildCallStackJson(const std::vector<Context> &contexts) {
-  json callStack = json::array();
-  for (const auto &ctx : contexts) {
-    callStack.push_back(ctx.name);
-  }
-  return callStack;
-}
-
-json buildFlexibleMetricsJson(const DataEntry::FlexibleMetricMap &flexibleMetrics) {
-  json metrics = json::object();
-  for (const auto &[metricName, metricValue] : flexibleMetrics) {
-    metrics[metricName] = formatFlexibleMetricValue(metricValue.getValues()[0]);
-  }
-  return metrics;
-}
-
-std::string buildFlexibleMetricEventName(
-    const std::vector<Context> &contexts,
-    const DataEntry::FlexibleMetricMap &flexibleMetrics) {
-  if (flexibleMetrics.empty()) {
-    return GraphState::metricTag;
-  }
-  const auto &scopeName =
-      contexts.empty() ? GraphState::metricTag : contexts.back().name;
-  auto appendTuple =
-      [&](std::ostringstream &os, const std::string &metricName,
-          const FlexibleMetric &metricValue) {
-        os << "<" << metricName << ", "
-           << formatFlexibleMetricValue(metricValue.getValues()[0]) << ">";
-      };
-  std::ostringstream os;
-  if (flexibleMetrics.size() == 1) {
-    os << scopeName << ": ";
-    const auto &[metricName, metricValue] = *flexibleMetrics.begin();
-    appendTuple(os, metricName, metricValue);
-    return os.str();
-  }
-  os << scopeName << ": ";
-  bool isFirst = true;
-  for (const auto &[metricName, metricValue] : flexibleMetrics) {
-    if (!isFirst) {
-      os << ", ";
-    }
-    appendTuple(os, metricName, metricValue);
-    isFirst = false;
-  }
-  return os.str();
-}
-
 std::vector<KernelTrace>
-convertToTimelineTrace(std::vector<CycleMetricWithContext> &cycleEvents) {
+convertToTimelineTrace(std::vector<CycleEvent> &cycleEvents) {
   std::vector<KernelTrace> results;
 
   auto getInt64Value = [](const CycleMetric *metric,
@@ -512,50 +422,49 @@ convertToTimelineTrace(std::vector<CycleMetricWithContext> &cycleEvents) {
     return std::get<std::string>(metric->getValue(kind));
   };
 
-  auto getKernelId = [&](const CycleMetricWithContext &event) {
+  auto getKernelId = [&](const CycleEvent &event) {
     return getInt64Value(event.cycleMetric, CycleMetric::KernelId);
   };
 
-  auto getBlockId = [&](const CycleMetricWithContext &event) {
+  auto getBlockId = [&](const CycleEvent &event) {
     return getInt64Value(event.cycleMetric, CycleMetric::BlockId);
   };
 
-  auto getUnitId = [&](const CycleMetricWithContext &event) {
+  auto getUnitId = [&](const CycleEvent &event) {
     return getInt64Value(event.cycleMetric, CycleMetric::UnitId);
   };
 
-  auto getStartCycle = [&](const CycleMetricWithContext &event) {
+  auto getStartCycle = [&](const CycleEvent &event) {
     return getInt64Value(event.cycleMetric, CycleMetric::StartCycle);
   };
 
-  auto getEndCycle = [&](const CycleMetricWithContext &event) {
+  auto getEndCycle = [&](const CycleEvent &event) {
     return getInt64Value(event.cycleMetric, CycleMetric::EndCycle);
   };
 
   // Pre-sort all events once
   auto &sortedEvents = cycleEvents;
-  std::sort(
-      sortedEvents.begin(), sortedEvents.end(),
-      [&](const CycleMetricWithContext &a, const CycleMetricWithContext &b) {
-        auto aKernelId = getKernelId(a);
-        auto bKernelId = getKernelId(b);
-        if (aKernelId != bKernelId)
-          return aKernelId < bKernelId;
+  std::sort(sortedEvents.begin(), sortedEvents.end(),
+            [&](const CycleEvent &a, const CycleEvent &b) {
+              auto aKernelId = getKernelId(a);
+              auto bKernelId = getKernelId(b);
+              if (aKernelId != bKernelId)
+                return aKernelId < bKernelId;
 
-        auto aBlockId = getBlockId(a);
-        auto bBlockId = getBlockId(b);
-        if (aBlockId != bBlockId)
-          return aBlockId < bBlockId;
+              auto aBlockId = getBlockId(a);
+              auto bBlockId = getBlockId(b);
+              if (aBlockId != bBlockId)
+                return aBlockId < bBlockId;
 
-        auto aUnitId = getUnitId(a);
-        auto bUnitId = getUnitId(b);
-        if (aUnitId != bUnitId)
-          return aUnitId < bUnitId;
+              auto aUnitId = getUnitId(a);
+              auto bUnitId = getUnitId(b);
+              if (aUnitId != bUnitId)
+                return aUnitId < bUnitId;
 
-        auto aStartCycle = getStartCycle(a);
-        auto bStartCycle = getStartCycle(b);
-        return aStartCycle < bStartCycle;
-      });
+              auto aStartCycle = getStartCycle(a);
+              auto bStartCycle = getStartCycle(b);
+              return aStartCycle < bStartCycle;
+            });
 
   size_t eventIndex = 0;
 
@@ -663,722 +572,302 @@ convertToTimelineTrace(std::vector<CycleMetricWithContext> &cycleEvents) {
   return results;
 }
 
-void dumpCycleMetricTrace(std::vector<CycleMetricWithContext> &cycleEvents,
+void dumpCycleMetricTrace(std::vector<CycleEvent> &cycleEvents,
                           std::ostream &os) {
   auto timeline = convertToTimelineTrace(cycleEvents);
   auto writer = StreamChromeTraceWriter(timeline, "");
   writer.write(os);
 }
 
-bool isContextPrefix(const std::vector<Context> &prefix,
-                     const std::vector<Context> &full) {
-  if (prefix.size() > full.size()) {
-    return false;
+std::string formatFlexibleMetricValue(const MetricValueType &value) {
+  return std::visit(
+      [](auto &&v) -> std::string {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, uint64_t> || std::is_same_v<T, int64_t> ||
+                      std::is_same_v<T, double>) {
+          return std::to_string(v);
+        } else if constexpr (std::is_same_v<T, std::string>) {
+          return v;
+        } else if constexpr (std::is_same_v<T, std::vector<uint64_t>> ||
+                             std::is_same_v<T, std::vector<int64_t>> ||
+                             std::is_same_v<T, std::vector<double>>) {
+          std::ostringstream ss;
+          ss << "[";
+          for (size_t i = 0; i < v.size(); ++i) {
+            if (i != 0) {
+              ss << ",";
+            }
+            ss << v[i];
+          }
+          ss << "]";
+          return ss.str();
+        } else {
+          static_assert(sizeof(T) == 0, "Unsupported MetricValueType");
+        }
+      },
+      value);
+}
+
+json buildCallStackJson(const std::vector<Context> &contexts) {
+  json callStack = json::array();
+  for (const auto &ctx : contexts) {
+    callStack.push_back(ctx.name);
   }
-  for (size_t i = 0; i < prefix.size(); ++i) {
-    if (prefix[i].name != full[i].name) {
-      return false;
+  return callStack;
+}
+
+json buildFlexibleMetricsJson(
+    const DataEntry::FlexibleMetricMap &flexibleMetrics) {
+  json metrics = json::object();
+  for (const auto &[metricName, metricValue] : flexibleMetrics) {
+    metrics[metricName] = formatFlexibleMetricValue(metricValue.getValues()[0]);
+  }
+  return metrics;
+}
+
+std::string
+buildFlexibleMetricEventName(const std::vector<Context> &contexts,
+                             const DataEntry::FlexibleMetricMap &flexibleMetrics) {
+  const auto &scopeName =
+      contexts.empty() ? GraphState::metricTag : contexts.back().name;
+  std::ostringstream ss;
+  ss << scopeName << ": ";
+  bool isFirst = true;
+  for (const auto &[metricName, metricValue] : flexibleMetrics) {
+    if (!isFirst) {
+      ss << ", ";
     }
+    ss << "<" << metricName << ", "
+       << formatFlexibleMetricValue(metricValue.getValues()[0]) << ">";
+    isFirst = false;
   }
-  return true;
+  return ss.str();
 }
 
-bool isHiddenGraphTraceContext(const Context &context) {
-  return context.name == GraphState::captureTag ||
-         context.name == kComputeMetadataScopeName;
-}
-
-std::vector<Context>
-normalizeGraphKernelContextsForTrace(const std::vector<Context> &contexts) {
-  std::vector<Context> normalizedContexts;
-  normalizedContexts.reserve(contexts.size());
-  for (const auto &context : contexts) {
-    if (!isHiddenGraphTraceContext(context)) {
-      normalizedContexts.push_back(context);
-    }
-  }
-  return normalizedContexts;
-}
-
-std::vector<Context> getGraphScopeContexts(const OrderedTraceEvent &event) {
-  if (!event.isGraphLinked || event.contexts.size() <= event.graphScopeStartIndex) {
-    return {};
-  }
-  if (event.contexts.size() <= event.graphScopeStartIndex + 1) {
-    return {};
-  }
-  return std::vector<Context>(event.contexts.begin(), event.contexts.end() - 1);
-}
-
-std::vector<std::vector<Context>>
-buildGraphScopePrefixes(const std::vector<Context> &scopeContexts,
-                        size_t scopeStartIndex) {
-  std::vector<std::vector<Context>> prefixes;
-  if (scopeStartIndex >= scopeContexts.size()) {
-    return prefixes;
-  }
-  prefixes.reserve(scopeContexts.size() - scopeStartIndex);
-  for (size_t i = scopeStartIndex; i < scopeContexts.size(); ++i) {
-    prefixes.emplace_back(scopeContexts.begin(), scopeContexts.begin() + i + 1);
-  }
-  return prefixes;
-}
-
-void upsertFlexibleMetric(DataEntry::FlexibleMetricMap &dst,
-                          const std::string &metricName,
-                          const FlexibleMetric &metric) {
-  auto it = dst.find(metricName);
-  if (it == dst.end()) {
-    dst.emplace(metricName, metric);
-  } else {
-    it->second.updateValue(metric.getValues()[0]);
-  }
-}
-
-void mergeFlexibleMetrics(DataEntry::FlexibleMetricMap &dst,
-                          const DataEntry::FlexibleMetricMap &src) {
-  for (const auto &[metricName, metric] : src) {
-    upsertFlexibleMetric(dst, metricName, metric);
-  }
-}
-
-std::optional<size_t> findGraphScopeRangeIndex(
-    const std::map<std::vector<Context>, std::vector<size_t>> &contextToIndices,
-    const std::vector<Context> &contexts, uint64_t startTimeNs,
-    uint64_t endTimeNs, const std::vector<GraphScopeRange> &graphScopeRanges) {
-  auto it = contextToIndices.find(contexts);
-  if (it == contextToIndices.end()) {
-    return std::nullopt;
-  }
-  for (auto rangeIndex : it->second) {
-    const auto &range = graphScopeRanges[rangeIndex];
-    if (range.startTimeNs <= startTimeNs && range.endTimeNs >= endTimeNs) {
-      return rangeIndex;
-    }
-  }
-  return std::nullopt;
-}
-
-uint64_t getGraphFlowBoundaryStartTimeNs(
-    const GraphScopeRange &targetRange, uint64_t kernelStartTimeNs,
-    const std::vector<GraphScopeRange> &graphScopeRanges) {
-  uint64_t boundaryStartTimeNs = targetRange.startTimeNs;
-  for (const auto &candidateRange : graphScopeRanges) {
-    if (candidateRange.contexts.size() <= targetRange.contexts.size()) {
-      continue;
-    }
-    if (!isContextPrefix(targetRange.contexts, candidateRange.contexts)) {
-      continue;
-    }
-    if (candidateRange.endTimeNs > kernelStartTimeNs) {
-      continue;
-    }
-    boundaryStartTimeNs = std::max(boundaryStartTimeNs, candidateRange.endTimeNs);
-  }
-  return boundaryStartTimeNs;
-}
-
-std::vector<Context>
-normalizeKernelContextsForLaunchScope(const std::vector<Context> &contexts,
-                                      const std::vector<Context> &scopeContexts) {
-  size_t commonPrefixSize = 0;
-  const auto maxCommonPrefixSize =
-      std::min(contexts.size(), scopeContexts.size());
-  while (commonPrefixSize < maxCommonPrefixSize &&
-         contexts[commonPrefixSize].name == scopeContexts[commonPrefixSize].name) {
-    ++commonPrefixSize;
-  }
-
-  std::vector<Context> normalizedContexts = scopeContexts;
-  normalizedContexts.insert(normalizedContexts.end(),
-                            contexts.begin() + commonPrefixSize,
-                            contexts.end());
-  return normalizedContexts;
-}
-
-size_t resolveLaunchScopeEventId(
-    size_t owningEventId, const std::vector<Context> &kernelContexts,
-    const std::map<size_t, TraceData::Trace::TraceEvent> &events,
-    const std::unordered_map<size_t, std::vector<Context>> &eventIdToContexts) {
-  auto fallbackEventId = TraceData::Trace::TraceEvent::DummyId;
-  auto currentEventId = owningEventId;
-  while (currentEventId != TraceData::Trace::TraceEvent::DummyId) {
-    auto eventIt = events.find(currentEventId);
-    if (eventIt == events.end()) {
-      break;
-    }
-    const auto &event = eventIt->second;
-    if (event.scopeId != Scope::DummyScopeId && event.hasCpuTimeRange()) {
-      fallbackEventId = currentEventId;
-      break;
-    }
-    if (event.launchScopeEventId != TraceData::Trace::TraceEvent::DummyId &&
-        event.launchScopeEventId != currentEventId) {
-      currentEventId = event.launchScopeEventId;
-    } else {
-      currentEventId = event.parentEventId;
-    }
-  }
-
-  const auto owningEventIt = events.find(owningEventId);
-  const auto hasOwningCpuStart =
-      owningEventIt != events.end() && owningEventIt->second.hasCpuStartTime;
-  const auto owningCpuStartTimeNs =
-      hasOwningCpuStart ? owningEventIt->second.cpuStartTimeNs : 0;
-  const auto owningThreadId =
-      owningEventIt != events.end() ? owningEventIt->second.threadId : 0;
-
-  std::vector<Context> candidateScopeContexts = kernelContexts;
-  if (!candidateScopeContexts.empty()) {
-    candidateScopeContexts.pop_back();
-  }
-  size_t bestMatchEventId = TraceData::Trace::TraceEvent::DummyId;
-  size_t bestMatchDepth = 0;
-  for (const auto &[eventId, event] : events) {
-    if (event.scopeId == Scope::DummyScopeId || !event.hasCpuTimeRange()) {
-      continue;
-    }
-    if (owningEventIt != events.end() && event.threadId != owningThreadId) {
-      continue;
-    }
-    if (hasOwningCpuStart &&
-        (owningCpuStartTimeNs < event.cpuStartTimeNs ||
-         owningCpuStartTimeNs > event.cpuEndTimeNs)) {
-      continue;
-    }
-    auto contextsIt = eventIdToContexts.find(eventId);
-    if (contextsIt == eventIdToContexts.end() ||
-        !isContextPrefix(contextsIt->second, candidateScopeContexts)) {
-      continue;
-    }
-    if (contextsIt->second.size() > bestMatchDepth) {
-      bestMatchEventId = eventId;
-      bestMatchDepth = contextsIt->second.size();
-    }
-  }
-  if (bestMatchEventId != TraceData::Trace::TraceEvent::DummyId) {
-    return bestMatchEventId;
-  }
-  return fallbackEventId;
-}
-
-std::optional<int64_t> computeKernelClockOffsetNs(
-    const std::vector<OrderedTraceEvent> &orderedTraceEvents,
-    const std::map<size_t, TraceData::Trace::TraceEvent> &events) {
-  std::vector<int64_t> offsets;
-  offsets.reserve(orderedTraceEvents.size());
-  for (const auto &event : orderedTraceEvents) {
-    if (event.kind != OrderedTraceEvent::Kind::Kernel || event.isGraphLinked) {
-      continue;
-    }
-    auto traceEventIt = events.find(event.owningEventId);
-    if (traceEventIt == events.end() || !traceEventIt->second.hasCpuStartTime) {
-      continue;
-    }
-    offsets.push_back(static_cast<int64_t>(traceEventIt->second.cpuStartTimeNs) -
-                      static_cast<int64_t>(event.startTimeNs));
-  }
-  if (offsets.empty()) {
-    return std::nullopt;
-  }
-  auto middle = offsets.begin() + offsets.size() / 2;
-  std::nth_element(offsets.begin(), middle, offsets.end());
-  return *middle;
-}
-
-uint64_t getAlignedTimestampNs(uint64_t timeNs,
-                               const std::optional<int64_t> &clockOffsetNs) {
-  if (!clockOffsetNs) {
-    return timeNs;
-  }
-  const auto alignedTimeNs = static_cast<int64_t>(timeNs) + *clockOffsetNs;
-  return alignedTimeNs < 0 ? 0 : static_cast<uint64_t>(alignedTimeNs);
-}
-
-std::optional<int64_t>
-getClockOffsetNs(const OrderedTraceEvent &event,
-                 const std::optional<int64_t> &kernelClockOffsetNs) {
-  if (event.explicitClockOffsetNs) {
-    return event.explicitClockOffsetNs;
-  }
-  if (event.kind == OrderedTraceEvent::Kind::Kernel) {
-    return kernelClockOffsetNs;
-  }
-  return std::nullopt;
-}
-
-uint64_t getAlignedStartTimeNs(const OrderedTraceEvent &event,
-                               const std::optional<int64_t> &kernelClockOffsetNs) {
-  return getAlignedTimestampNs(event.startTimeNs,
-                               getClockOffsetNs(event, kernelClockOffsetNs));
-}
-
-std::string getCpuThreadTid(uint64_t threadId) {
-  return std::string(kCpuThreadTidPrefix) + std::to_string(threadId);
-}
-
-std::string getStreamTid(size_t streamId) {
-  return "Stream: " + std::to_string(streamId);
-}
-
-std::string getGraphTid(size_t streamId) {
-  return "Graph: Stream " + std::to_string(streamId);
-}
-
-std::optional<std::pair<size_t, uint64_t>> getCpuFlowSourceScopeEventIdAndTimeNs(
-    const OrderedTraceEvent &event,
-    const std::map<size_t, TraceData::Trace::TraceEvent> &events) {
-  if (event.launchScopeEventId == TraceData::Trace::TraceEvent::DummyId) {
-    return std::nullopt;
-  }
-  auto scopeEventIt = events.find(event.launchScopeEventId);
-  if (scopeEventIt == events.end()) {
-    return std::nullopt;
-  }
-  const auto &scopeEvent = scopeEventIt->second;
-  if (!scopeEvent.hasCpuTimeRange()) {
-    return std::nullopt;
-  }
-  auto sourceTimeNs = scopeEvent.cpuStartTimeNs;
-  if (auto owningEventIt = events.find(event.owningEventId);
-      owningEventIt != events.end() && owningEventIt->second.hasCpuStartTime) {
-    sourceTimeNs = owningEventIt->second.cpuStartTimeNs;
-  }
-  if (scopeEvent.hasCpuTimeRange()) {
-    sourceTimeNs =
-        std::clamp(sourceTimeNs, scopeEvent.cpuStartTimeNs, scopeEvent.cpuEndTimeNs);
-  }
-  return std::make_pair(event.launchScopeEventId, sourceTimeNs);
-}
-
-uint64_t getAdjustedFlowStartTimeNs(
-    uint64_t sourceTimeNs, uint64_t alignedKernelStartTimeNs,
-    const TraceData::Trace::TraceEvent &scopeEvent) {
-  auto latestFlowStartTimeNs =
-      std::min(scopeEvent.cpuEndTimeNs, alignedKernelStartTimeNs);
-  if (latestFlowStartTimeNs > scopeEvent.cpuStartTimeNs) {
-    latestFlowStartTimeNs -= 1;
-  }
-  if (latestFlowStartTimeNs < scopeEvent.cpuStartTimeNs) {
-    return scopeEvent.cpuStartTimeNs;
-  }
-  return std::clamp(sourceTimeNs, scopeEvent.cpuStartTimeNs,
-                    latestFlowStartTimeNs);
-}
-
-uint64_t getAdjustedGraphFlowStartTimeNs(uint64_t alignedGraphScopeStartTimeNs,
-                                         uint64_t alignedGraphScopeEndTimeNs,
-                                         uint64_t alignedKernelStartTimeNs) {
-  auto latestFlowStartTimeNs =
-      std::min(alignedGraphScopeEndTimeNs, alignedKernelStartTimeNs);
-  if (latestFlowStartTimeNs < alignedGraphScopeStartTimeNs) {
-    return alignedGraphScopeStartTimeNs;
-  }
-  auto earliestFlowStartTimeNs = alignedGraphScopeStartTimeNs;
-  if (earliestFlowStartTimeNs < latestFlowStartTimeNs) {
-    earliestFlowStartTimeNs += 1;
-  }
-  return std::min(earliestFlowStartTimeNs, latestFlowStartTimeNs);
-}
+struct OpenGraphScope {
+  const std::vector<Context> *contexts{};
+  uint64_t startTimeNs{};
+};
 
 void reconstructGraphScopeEvents(
-    std::vector<OrderedTraceEvent> &orderedTraceEvents,
-    const std::map<size_t, TraceData::Trace::TraceEvent> &events) {
-  using GroupKey = std::pair<size_t, size_t>;
-  std::map<GroupKey, std::vector<GraphKernelRecord>> groupToGraphKernels;
-  std::map<size_t, GraphKernelRecord> owningEventIdToFirstGraphKernel;
-  for (size_t i = 0; i < orderedTraceEvents.size(); ++i) {
-    const auto &event = orderedTraceEvents[i];
-    if (event.kind != OrderedTraceEvent::Kind::Kernel || !event.isGraphLinked) {
-      continue;
-    }
-    auto scopeContexts = getGraphScopeContexts(event);
-    if (scopeContexts.empty()) {
-      continue;
-    }
-    auto record =
-        GraphKernelRecord{i, event.owningEventId, event.streamId, event.startTimeNs,
-                          event.endTimeNs, event.graphScopeStartIndex,
-                          std::move(scopeContexts),
-                          event.getFlexibleMetrics()};
-    groupToGraphKernels[{event.owningEventId, event.streamId}].push_back(record);
-    auto firstGraphKernelIt = owningEventIdToFirstGraphKernel.find(event.owningEventId);
-    if (firstGraphKernelIt == owningEventIdToFirstGraphKernel.end() ||
-        record.startTimeNs < firstGraphKernelIt->second.startTimeNs ||
-        (record.startTimeNs == firstGraphKernelIt->second.startTimeNs &&
-         record.endTimeNs < firstGraphKernelIt->second.endTimeNs) ||
-        (record.startTimeNs == firstGraphKernelIt->second.startTimeNs &&
-         record.endTimeNs == firstGraphKernelIt->second.endTimeNs &&
-         record.orderedEventIndex < firstGraphKernelIt->second.orderedEventIndex)) {
-      owningEventIdToFirstGraphKernel[event.owningEventId] = record;
-    }
-  }
-
-  std::map<size_t, std::optional<int64_t>> owningEventIdToClockOffsetNs;
-  for (const auto &[owningEventId, firstGraphKernel] : owningEventIdToFirstGraphKernel) {
-    const auto &firstKernelEvent =
-        orderedTraceEvents[firstGraphKernel.orderedEventIndex];
-    std::optional<uint64_t> anchorTimeNs;
-    if (auto flowSource =
-            getCpuFlowSourceScopeEventIdAndTimeNs(firstKernelEvent, events);
-        flowSource) {
-      anchorTimeNs = flowSource->second;
-    } else if (auto traceEventIt = events.find(owningEventId);
-               traceEventIt != events.end() &&
-               traceEventIt->second.hasCpuStartTime) {
-      anchorTimeNs = traceEventIt->second.cpuStartTimeNs;
-    }
-    if (anchorTimeNs) {
-      owningEventIdToClockOffsetNs[owningEventId] =
-          static_cast<int64_t>(*anchorTimeNs) -
-          static_cast<int64_t>(firstGraphKernel.startTimeNs);
-    }
-  }
-
-  std::vector<OrderedTraceEvent> graphScopeEvents;
-  for (auto &[_, graphKernelRecords] : groupToGraphKernels) {
-    std::sort(graphKernelRecords.begin(), graphKernelRecords.end(),
-              [](const GraphKernelRecord &lhs, const GraphKernelRecord &rhs) {
-                if (lhs.startTimeNs != rhs.startTimeNs) {
-                  return lhs.startTimeNs < rhs.startTimeNs;
-                }
-                if (lhs.endTimeNs != rhs.endTimeNs) {
-                  return lhs.endTimeNs < rhs.endTimeNs;
-                }
-                return lhs.orderedEventIndex < rhs.orderedEventIndex;
-              });
-
-    const auto graphClockOffsetIt =
-        owningEventIdToClockOffsetNs.find(graphKernelRecords.front().owningEventId);
-    const auto graphClockOffsetNs =
-        graphClockOffsetIt != owningEventIdToClockOffsetNs.end()
-            ? graphClockOffsetIt->second
-            : std::nullopt;
-
-    std::vector<OpenGraphScope> openScopes;
-    std::vector<GraphScopeRange> graphScopeRanges;
-    uint64_t previousEndTimeNs = 0;
-    bool hasPreviousRange = false;
-
-    for (const auto &record : graphKernelRecords) {
-      auto scopePrefixes =
-          buildGraphScopePrefixes(record.scopeContexts, record.scopeStartIndex);
-      if (scopePrefixes.empty()) {
+    const std::map<size_t, std::vector<KernelEvent>> &kernelEvents,
+    std::map<size_t, std::vector<GraphScopeEvent>> &graphScopeEvents) {
+  std::map</*stream_id=*/size_t, std::deque<OpenGraphScope>> openGraphScopes;
+  for (const auto &[streamId, streamKernelEvents] : kernelEvents) {
+    for (const auto &kernelEvent : streamKernelEvents) {
+      if (!kernelEvent.isGraphLinked)
         continue;
-      }
-
-      size_t commonPrefixSize = 0;
-      while (commonPrefixSize < openScopes.size() &&
-             commonPrefixSize < scopePrefixes.size() &&
-             openScopes[commonPrefixSize].contexts ==
-                 scopePrefixes[commonPrefixSize]) {
-        ++commonPrefixSize;
-      }
-
-      if (hasPreviousRange) {
-        while (openScopes.size() > commonPrefixSize) {
-          auto openScope = std::move(openScopes.back());
-          openScopes.pop_back();
-          graphScopeRanges.push_back(GraphScopeRange{
-              std::move(openScope.contexts), record.streamId,
-              openScope.startTimeNs, previousEndTimeNs, {}});
+      auto &openScopes = openGraphScopes[streamId];
+      auto &contexts = kernelEvent.contexts;
+      auto startTimeNs = std::get<uint64_t>(
+          kernelEvent.kernelMetric->getValue(KernelMetric::StartTime));
+      auto endTimeNs = std::get<uint64_t>(
+          kernelEvent.kernelMetric->getValue(KernelMetric::EndTime));
+      // A streaming algorithm to find start and end time of graph scopes based on common context prefix
+      if (openScopes.empty()) {
+        // There's no open graph scope, we start a new stack of scopes
+        openScopes.push_back({&contexts, startTimeNs});
+      } else {
+        while (!openScopes.empty()) {
+          auto &tailOpenScope = openScopes.back();
+          auto numCommonPrefixes = 0;
+          for (size_t i = 0;
+              i < tailOpenScope.contexts->size() && i < contexts.size(); ++i) {
+            if (tailOpenScope.contexts->at(i).name != contexts[i].name)
+              break;
+            numCommonPrefixes++;
+          }
+          if (numCommonPrefixes < tailOpenScope.contexts->size()) {
+            // Partial common prefix
+            graphScopeEvents[streamId].push_back({*tailOpenScope.contexts,
+                                                  tailOpenScope.startTimeNs,
+                                                  startTimeNs});
+            openScopes.pop_back();
+          } else {
+            if (numCommonPrefixes == contexts.size()) {
+              // The new kernel's context is exactly the same as the open scope,
+              // we keep the existing scope
+              break;
+            } else {
+              // The new kernel's context is a super set of the open scope, we
+              // start a new scope on top of the existing one
+              openScopes.push_back({&contexts, startTimeNs});
+              break;
+            }
+          }
         }
       }
-
-      for (size_t i = commonPrefixSize; i < scopePrefixes.size(); ++i) {
-        openScopes.push_back(
-            OpenGraphScope{std::move(scopePrefixes[i]), record.startTimeNs});
-      }
-      previousEndTimeNs = record.endTimeNs;
-      hasPreviousRange = true;
-    }
-
-    while (!openScopes.empty()) {
-      auto openScope = std::move(openScopes.back());
-      openScopes.pop_back();
-      graphScopeRanges.push_back(GraphScopeRange{
-          std::move(openScope.contexts), graphKernelRecords.front().streamId,
-          openScope.startTimeNs, previousEndTimeNs, {}});
-    }
-
-    std::sort(graphScopeRanges.begin(), graphScopeRanges.end(),
-              [](const GraphScopeRange &lhs, const GraphScopeRange &rhs) {
-                if (lhs.startTimeNs != rhs.startTimeNs) {
-                  return lhs.startTimeNs < rhs.startTimeNs;
-                }
-                if (lhs.endTimeNs != rhs.endTimeNs) {
-                  return lhs.endTimeNs > rhs.endTimeNs;
-                }
-                return lhs.contexts.size() < rhs.contexts.size();
-              });
-
-    std::map<std::vector<Context>, std::vector<size_t>> contextToIndices;
-    for (size_t i = 0; i < graphScopeRanges.size(); ++i) {
-      contextToIndices[graphScopeRanges[i].contexts].push_back(i);
-    }
-
-    for (const auto &record : graphKernelRecords) {
-      auto rangeIndex = findGraphScopeRangeIndex(
-          contextToIndices, record.scopeContexts, record.startTimeNs,
-          record.endTimeNs, graphScopeRanges);
-      if (!rangeIndex) {
-        continue;
-      }
-      auto &kernelEvent = orderedTraceEvents[record.orderedEventIndex];
-      auto &graphScopeRange = graphScopeRanges[*rangeIndex];
-      const auto graphFlowBoundaryStartTimeNs = getGraphFlowBoundaryStartTimeNs(
-          graphScopeRange, record.startTimeNs, graphScopeRanges);
-      kernelEvent.explicitClockOffsetNs = graphClockOffsetNs;
-      kernelEvent.hasGraphFlowSource = true;
-      kernelEvent.graphFlowStartTimeNs = graphFlowBoundaryStartTimeNs;
-      kernelEvent.graphFlowEndTimeNs = graphScopeRange.endTimeNs;
-      if (kernelEvent.isMetricKernel && record.flexibleMetrics &&
-          !record.flexibleMetrics->empty()) {
-        mergeFlexibleMetrics(graphScopeRange.flexibleMetrics,
-                             *record.flexibleMetrics);
-      }
-    }
-
-    for (auto &graphScopeRange : graphScopeRanges) {
-      std::shared_ptr<DataEntry::FlexibleMetricMap> flexibleMetricsStorage;
-      if (!graphScopeRange.flexibleMetrics.empty()) {
-        flexibleMetricsStorage = std::make_shared<DataEntry::FlexibleMetricMap>(
-            std::move(graphScopeRange.flexibleMetrics));
-      }
-      graphScopeEvents.push_back(OrderedTraceEvent::graphScope(
-          std::move(graphScopeRange.contexts), graphScopeRange.streamId,
-          graphScopeRange.startTimeNs, graphScopeRange.endTimeNs,
-          std::move(flexibleMetricsStorage), graphClockOffsetNs));
     }
   }
+}
 
-  orderedTraceEvents.insert(orderedTraceEvents.end(),
-                            std::make_move_iterator(graphScopeEvents.begin()),
-                            std::make_move_iterator(graphScopeEvents.end()));
+void dumpKernelEvents(
+    uint64_t minTimeStamp,
+    std::map<size_t, std::vector<KernelEvent>> &kernelEvents,
+    json &object, std::ostream &os) {
+  // Sort all events in order
+  for (auto &[streamId, events] : kernelEvents) {
+    std::sort(events.begin(), events.end(),
+              [](const KernelEvent &a, const KernelEvent &b) {
+                auto aStartTime = std::get<uint64_t>(
+                    a.kernelMetric->getValue(KernelMetric::StartTime));
+                auto bStartTime = std::get<uint64_t>(
+                    b.kernelMetric->getValue(KernelMetric::StartTime));
+                return aStartTime < bStartTime;
+              });
+  }
+  for (auto const &[streamId, events] : kernelEvents) {
+    for (const auto &event : events) {
+      auto *kernelMetric = event.kernelMetric;
+      auto *flexibleMetrics = event.flexibleMetrics;
+      uint64_t startTimeNs =
+          std::get<uint64_t>(kernelMetric->getValue(KernelMetric::StartTime));
+      uint64_t endTimeNs =
+          std::get<uint64_t>(kernelMetric->getValue(KernelMetric::EndTime));
+      // Convert nanoseconds to microseconds for Chrome trace format
+      double ts = static_cast<double>(startTimeNs - minTimeStamp) / 1000;
+      double dur = static_cast<double>(endTimeNs - startTimeNs) / 1000;
+
+      const auto &contexts = event.contexts;
+
+      json element;
+      if (flexibleMetrics) {
+        element["name"] = GraphState::metricTag;
+      } else {
+        element["name"] = contexts.back().name;
+      }
+      element["cat"] = "kernel";
+      element["ph"] = "X";
+      element["ts"] = ts;
+      element["dur"] = dur;
+      element["tid"] = streamId; // thread id = stream
+      element["args"]["call_stack"] = buildCallStackJson(contexts);
+      if (flexibleMetrics) {
+        element["args"]["metrics"] = buildFlexibleMetricsJson(*flexibleMetrics);
+      }
+      object["traceEvents"].push_back(element);
+    }
+  }
+}
+
+void dumpCpuScopeEvents(
+    uint64_t minTimeStamp,
+    std::map<size_t, std::vector<CpuScopeEvent>> &cpuScopeEvents,
+    json &object, std::ostream &os) {
+  for (auto &[threadId, events] : cpuScopeEvents) {
+    std::sort(events.begin(), events.end(),
+              [](const CpuScopeEvent &a, const CpuScopeEvent &b) {
+                return a.startTimeNs < b.startTimeNs;
+              });
+  }
+  for (const auto &[threadId, events] : cpuScopeEvents) {
+    for (const auto &event : events) {
+      const auto *flexibleMetrics = event.flexibleMetrics;
+      const double ts =
+          static_cast<double>(event.startTimeNs - minTimeStamp) / 1000.0;
+      const double dur =
+          static_cast<double>(event.endTimeNs - event.startTimeNs) / 1000.0;
+
+      json element;
+      if (flexibleMetrics != nullptr && !flexibleMetrics->empty()) {
+        element["name"] =
+            buildFlexibleMetricEventName(event.contexts, *flexibleMetrics);
+        element["cat"] = "metric";
+        element["args"]["metrics"] = buildFlexibleMetricsJson(*flexibleMetrics);
+      } else {
+        element["name"] =
+            event.contexts.empty() ? "" : event.contexts.back().name;
+        element["cat"] = "scope";
+      }
+      element["ph"] = "X";
+      element["ts"] = ts;
+      element["dur"] = dur;
+      element["tid"] = std::string(kCpuThreadTidPrefix) + std::to_string(threadId);
+      element["args"]["call_stack"] = buildCallStackJson(event.contexts);
+      object["traceEvents"].push_back(std::move(element));
+    }
+  }
+}
+
+void dumpGraphScopeEvents(
+    uint64_t minTimeStamp,
+    std::map<size_t, std::vector<GraphScopeEvent>> &graphScopeEvents,
+    json &object, std::ostream &os) {
+  struct Boundary {
+    const GraphScopeEvent *event{};
+    uint64_t timeNs{};
+    bool isBegin{};
+  };
+
+  for (auto &[streamId, events] : graphScopeEvents) {
+    std::sort(events.begin(), events.end(),
+              [](const GraphScopeEvent &a, const GraphScopeEvent &b) {
+                return a.startTimeNs < b.startTimeNs;
+              });
+
+    std::vector<Boundary> boundaries;
+    boundaries.reserve(events.size() * 2);
+    for (const auto &event : events) {
+      if (event.contexts.empty()) {
+        continue;
+      }
+      boundaries.push_back({&event, event.startTimeNs, true});
+      boundaries.push_back({&event, event.endTimeNs, false});
+    }
+
+    std::sort(boundaries.begin(), boundaries.end(),
+              [](const Boundary &a, const Boundary &b) {
+                if (a.timeNs != b.timeNs) {
+                  return a.timeNs < b.timeNs;
+                }
+                if (a.isBegin != b.isBegin) {
+                  return a.isBegin && !b.isBegin;
+                }
+                if (a.event->contexts.size() != b.event->contexts.size()) {
+                  if (a.isBegin) {
+                    return a.event->contexts.size() < b.event->contexts.size();
+                  }
+                  return a.event->contexts.size() > b.event->contexts.size();
+                }
+                return a.event->contexts < b.event->contexts;
+              });
+
+    const auto graphTid = std::string("Graph: Stream ") + std::to_string(streamId);
+    for (const auto &boundary : boundaries) {
+      json element;
+      if (boundary.event->flexibleMetrics != nullptr &&
+          !boundary.event->flexibleMetrics->empty()) {
+        element["name"] = buildFlexibleMetricEventName(
+            boundary.event->contexts, *boundary.event->flexibleMetrics);
+        element["cat"] = "metric";
+        element["args"]["metrics"] =
+            buildFlexibleMetricsJson(*boundary.event->flexibleMetrics);
+      } else {
+        element["name"] = boundary.event->contexts.back().name;
+        element["cat"] = "scope";
+      }
+      element["ph"] = boundary.isBegin ? "B" : "E";
+      element["ts"] =
+          static_cast<double>(boundary.timeNs - minTimeStamp) / 1000.0;
+      element["tid"] = graphTid;
+      element["args"]["call_stack"] =
+          buildCallStackJson(boundary.event->contexts);
+      object["traceEvents"].push_back(std::move(element));
+    }
+  }
 }
 
 void dumpKernelMetricTrace(
-    const std::vector<OrderedTraceEvent> &orderedTraceEvents,
-    const std::map<size_t, TraceData::Trace::TraceEvent> &events,
+    uint64_t minTimeStamp,
+    std::map<size_t, std::vector<KernelEvent>> &kernelEvents,
+    std::map<size_t, std::vector<CpuScopeEvent>> &cpuScopeEvents,
+    std::map<size_t, std::vector<GraphScopeEvent>> &graphScopeEvents,
     std::ostream &os) {
   json object = {{"displayTimeUnit", "us"}, {"traceEvents", json::array()}};
-  const bool hasCpuScopeEvents = std::any_of(
-      orderedTraceEvents.begin(), orderedTraceEvents.end(),
-      [](const auto &event) {
-        return event.kind == OrderedTraceEvent::Kind::CpuScope;
-      });
-  const auto kernelClockOffsetNs =
-      hasCpuScopeEvents ? computeKernelClockOffsetNs(orderedTraceEvents, events)
-                         : std::nullopt;
-  auto minTimeStamp = std::numeric_limits<uint64_t>::max();
-  for (const auto &event : orderedTraceEvents) {
-    minTimeStamp =
-        std::min(minTimeStamp, getAlignedStartTimeNs(event, kernelClockOffsetNs));
-    if (event.kind == OrderedTraceEvent::Kind::Kernel) {
-      const auto alignedStartTimeNs =
-          getAlignedStartTimeNs(event, kernelClockOffsetNs);
-      if (event.hasGraphFlowSource) {
-        const auto alignedGraphScopeStartTimeNs = getAlignedTimestampNs(
-            event.graphFlowStartTimeNs,
-            getClockOffsetNs(event, kernelClockOffsetNs));
-        const auto alignedGraphScopeEndTimeNs = getAlignedTimestampNs(
-            event.graphFlowEndTimeNs, getClockOffsetNs(event, kernelClockOffsetNs));
-        const auto adjustedGraphFlowStartTimeNs = getAdjustedGraphFlowStartTimeNs(
-            alignedGraphScopeStartTimeNs, alignedGraphScopeEndTimeNs,
-            alignedStartTimeNs);
-        minTimeStamp =
-            std::min(minTimeStamp,
-                     std::min(adjustedGraphFlowStartTimeNs, alignedStartTimeNs));
-      } else if (auto flowSource =
-                     getCpuFlowSourceScopeEventIdAndTimeNs(event, events);
-                 flowSource) {
-        const auto &scopeEvent = events.at(flowSource->first);
-        minTimeStamp = std::min(
-            minTimeStamp, getAdjustedFlowStartTimeNs(flowSource->second,
-                                                     alignedStartTimeNs,
-                                                     scopeEvent));
-      }
-    }
-  }
-  uint64_t nextFlowId = 0;
-  auto buildScopeTraceElement = [&](const OrderedTraceEvent &event) {
-    json element;
-    const bool eventHasFlexibleMetrics = hasFlexibleMetrics(event);
-    element["name"] = eventHasFlexibleMetrics
-                          ? buildFlexibleMetricEventName(
-                                event.contexts, *event.getFlexibleMetrics())
-                          : event.contexts.back().name;
-    element["cat"] = eventHasFlexibleMetrics ? "metric" : "scope";
-    if (event.kind == OrderedTraceEvent::Kind::CpuScope) {
-      element["tid"] = getCpuThreadTid(event.threadId);
-      element["args"]["thread_id"] = event.threadId;
-    } else {
-      element["tid"] = getGraphTid(event.streamId);
-    }
-    element["args"]["call_stack"] = buildCallStackJson(event.contexts);
-    if (eventHasFlexibleMetrics) {
-      element["args"]["metrics"] =
-          buildFlexibleMetricsJson(*event.getFlexibleMetrics());
-    }
-    return element;
-  };
-  auto appendTraceEvent = [&](const OrderedTraceEvent &event) {
-    if (event.kind == OrderedTraceEvent::Kind::GraphScope) {
-      return;
-    }
-    if (event.kind == OrderedTraceEvent::Kind::CpuScope && event.contexts.empty()) {
-      return;
-    }
 
-    json element;
-    if (event.kind == OrderedTraceEvent::Kind::Kernel) {
-      if (event.isMetricKernel) {
-        element["name"] = GraphState::metricTag;
-      } else {
-        element["name"] = event.contexts.back().name;
-      }
-      element["cat"] = "kernel";
-      element["tid"] = getStreamTid(event.streamId);
-    } else {
-      element = buildScopeTraceElement(event);
-    }
-    const auto alignedStartTimeNs =
-        getAlignedStartTimeNs(event, kernelClockOffsetNs);
-    element["ph"] = "X";
-    element["ts"] =
-        static_cast<double>(alignedStartTimeNs - minTimeStamp) / 1000.0;
-    element["dur"] =
-        static_cast<double>(event.endTimeNs - event.startTimeNs) / 1000.0;
-    element["args"]["call_stack"] = buildCallStackJson(event.contexts);
-    if (hasFlexibleMetrics(event)) {
-      element["args"]["metrics"] =
-          buildFlexibleMetricsJson(*event.getFlexibleMetrics());
-    }
-    object["traceEvents"].push_back(element);
-    if (event.kind != OrderedTraceEvent::Kind::Kernel) {
-      return;
-    }
-    if (event.hasGraphFlowSource) {
-      const auto alignedGraphScopeStartTimeNs = getAlignedTimestampNs(
-          event.graphFlowStartTimeNs, getClockOffsetNs(event, kernelClockOffsetNs));
-      const auto alignedGraphScopeEndTimeNs = getAlignedTimestampNs(
-          event.graphFlowEndTimeNs, getClockOffsetNs(event, kernelClockOffsetNs));
-      const auto adjustedGraphFlowStartTimeNs = getAdjustedGraphFlowStartTimeNs(
-          alignedGraphScopeStartTimeNs, alignedGraphScopeEndTimeNs,
-          alignedStartTimeNs);
-      json flowStart = {{"name", kLaunchFlowName},
-                        {"cat", kLaunchFlowCategory},
-                        {"ph", "s"},
-                        {"bp", "e"},
-                        {"id", nextFlowId},
-                        {"ts",
-                         static_cast<double>(adjustedGraphFlowStartTimeNs -
-                                             minTimeStamp) /
-                             1000.0},
-                        {"tid", getGraphTid(event.streamId)}};
-      json flowFinish = {{"name", kLaunchFlowName},
-                         {"cat", kLaunchFlowCategory},
-                         {"ph", "f"},
-                         {"bp", "e"},
-                         {"id", nextFlowId},
-                         {"ts",
-                          static_cast<double>(alignedStartTimeNs - minTimeStamp) /
-                              1000.0},
-                         {"tid", getStreamTid(event.streamId)}};
-      object["traceEvents"].push_back(flowStart);
-      object["traceEvents"].push_back(flowFinish);
-      ++nextFlowId;
-      return;
-    }
-    const auto flowSource = getCpuFlowSourceScopeEventIdAndTimeNs(event, events);
-    if (!flowSource) {
-      return;
-    }
-    const auto [metricScopeEventId, sourceTimeNs] = *flowSource;
-    const auto &scopeEvent = events.at(metricScopeEventId);
-    const auto adjustedFlowStartTimeNs =
-        getAdjustedFlowStartTimeNs(sourceTimeNs, alignedStartTimeNs, scopeEvent);
-    json flowStart = {{"name", kLaunchFlowName},
-                      {"cat", kLaunchFlowCategory},
-                      {"ph", "s"},
-                      {"bp", "e"},
-                      {"id", nextFlowId},
-                      {"ts",
-                       static_cast<double>(adjustedFlowStartTimeNs - minTimeStamp) /
-                           1000.0},
-                      {"tid", getCpuThreadTid(scopeEvent.threadId)}};
-    json flowFinish = {{"name", kLaunchFlowName},
-                       {"cat", kLaunchFlowCategory},
-                       {"ph", "f"},
-                       {"bp", "e"},
-                       {"id", nextFlowId},
-                       {"ts",
-                        static_cast<double>(alignedStartTimeNs - minTimeStamp) /
-                            1000.0},
-                       {"tid", getStreamTid(event.streamId)}};
-    object["traceEvents"].push_back(flowStart);
-    object["traceEvents"].push_back(flowFinish);
-    ++nextFlowId;
-  };
-  std::vector<GraphScopeBoundary> graphScopeBoundaries;
-  graphScopeBoundaries.reserve(orderedTraceEvents.size() * 2);
-  size_t nextGraphScopeBoundaryOrder = 0;
-  for (const auto &event : orderedTraceEvents) {
-    if (event.kind != OrderedTraceEvent::Kind::GraphScope || event.contexts.empty()) {
-      continue;
-    }
-    const auto clockOffsetNs = getClockOffsetNs(event, kernelClockOffsetNs);
-    graphScopeBoundaries.push_back(
-        GraphScopeBoundary{&event,
-                           getAlignedTimestampNs(event.startTimeNs, clockOffsetNs),
-                           true,
-                           nextGraphScopeBoundaryOrder++});
-    graphScopeBoundaries.push_back(
-        GraphScopeBoundary{&event,
-                           getAlignedTimestampNs(event.endTimeNs, clockOffsetNs),
-                           false,
-                           nextGraphScopeBoundaryOrder++});
-  }
-  std::sort(graphScopeBoundaries.begin(), graphScopeBoundaries.end(),
-            [](const GraphScopeBoundary &lhs, const GraphScopeBoundary &rhs) {
-              if (lhs.alignedTimeNs != rhs.alignedTimeNs) {
-                return lhs.alignedTimeNs < rhs.alignedTimeNs;
-              }
-              if (lhs.isBegin != rhs.isBegin) {
-                return !lhs.isBegin && rhs.isBegin;
-              }
-              if (lhs.event->contexts.size() != rhs.event->contexts.size()) {
-                if (lhs.isBegin) {
-                  return lhs.event->contexts.size() < rhs.event->contexts.size();
-                }
-                return lhs.event->contexts.size() > rhs.event->contexts.size();
-              }
-              if (lhs.event->contexts != rhs.event->contexts) {
-                return lhs.event->contexts < rhs.event->contexts;
-              }
-              return lhs.insertionOrder < rhs.insertionOrder;
-            });
-  auto appendGraphScopeBoundary = [&](const GraphScopeBoundary &boundary) {
-    json element = buildScopeTraceElement(*boundary.event);
-    element["ph"] = boundary.isBegin ? "B" : "E";
-    element["ts"] =
-        static_cast<double>(boundary.alignedTimeNs - minTimeStamp) / 1000.0;
-    object["traceEvents"].push_back(element);
-  };
-
-  for (const auto &event : orderedTraceEvents) {
-    if (event.kind == OrderedTraceEvent::Kind::CpuScope) {
-      appendTraceEvent(event);
-    }
-  }
-  for (const auto &boundary : graphScopeBoundaries) {
-    appendGraphScopeBoundary(boundary);
-  }
-  for (const auto &event : orderedTraceEvents) {
-    if (event.kind == OrderedTraceEvent::Kind::Kernel) {
-      appendTraceEvent(event);
-    }
-  }
+  dumpCpuScopeEvents(minTimeStamp, cpuScopeEvents, object, os);
+  dumpGraphScopeEvents(minTimeStamp, graphScopeEvents, object, os);
+  dumpKernelEvents(minTimeStamp, kernelEvents, object, os);
 
   os << object.dump() << "\n";
 }
@@ -1386,23 +875,27 @@ void dumpKernelMetricTrace(
 } // namespace
 
 void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
-  std::set<size_t> virtualTargetEntryIds;
+  std::set<size_t> targetEntryIds;
+  // First, check whether any target entries are linked.
+  // If so, resolve their contexts with a single lock on the virtual phase.
+  // The virtual phase is shared by all active phases, so locking it is
+  // expensive and we want to keep the lock duration as short as possible.
   tracePhases.withPtr(phase, [&](Trace *trace) {
     for (const auto &[_, event] : trace->getEvents()) {
       for (const auto &[targetEntryId, _] : event.metricSet.linkedMetrics) {
-        virtualTargetEntryIds.insert(targetEntryId);
+        targetEntryIds.insert(targetEntryId);
       }
       for (const auto &[targetEntryId, _] :
            event.metricSet.linkedFlexibleMetrics) {
-        virtualTargetEntryIds.insert(targetEntryId);
+        targetEntryIds.insert(targetEntryId);
       }
     }
   });
 
   std::map<size_t, std::vector<Context>> targetIdToVirtualContexts;
-  if (!virtualTargetEntryIds.empty()) {
+  if (!targetEntryIds.empty()) {
     tracePhases.withPtr(Data::kVirtualPhase, [&](Trace *virtualTrace) {
-      for (auto targetEntryId : virtualTargetEntryIds) {
+      for (auto targetEntryId : targetEntryIds) {
         // Linked target ids are event ids, so resolve through the event first.
         auto &targetEvent = virtualTrace->getEvent(targetEntryId);
         auto contexts = virtualTrace->getContexts(targetEvent.contextId);
@@ -1412,63 +905,45 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
     });
   }
 
+  // After virtual contexts are resolved, we can proceed to process events in
+  // the actual phase without worrying about locking duration.
   tracePhases.withPtr(phase, [&](Trace *trace) {
     auto &events = trace->getEvents();
-    std::vector<OrderedTraceEvent> orderedTraceEvents;
-    orderedTraceEvents.reserve(events.size() * 2);
-    std::unordered_map<size_t, std::vector<Context>> eventIdToContexts;
-    eventIdToContexts.reserve(events.size());
-    for (const auto &[eventId, event] : events) {
-      eventIdToContexts.emplace(eventId, trace->getContexts(event.contextId));
-    }
-    bool hasKernelMetrics = false, hasCycleMetrics = false,
-         hasCpuScopeEvents = false;
-    std::vector<CycleMetricWithContext> cycleEvents;
+    std::map</*stream_id=*/size_t, std::vector<KernelEvent>> kernelEvents;
+    std::map</*thread_id=*/size_t, std::vector<CpuScopeEvent>> cpuScopeEvents;
+    std::map</*stream_id=*/size_t, std::vector<GraphScopeEvent>>
+        graphScopeEvents;
+    std::vector<CycleEvent> cycleEvents;
     cycleEvents.reserve(events.size());
+    // Initialize minTimeStamp to the maximum possible value to ensure correct
+    // calculation of relative timestamps
+    uint64_t minTimeStamp = std::numeric_limits<uint64_t>::max();
+    std::unordered_map<size_t, std::vector<Context>> contextIdToContexts(
+        events.size());
+    for (const auto &[_, event] : events) {
+      contextIdToContexts.try_emplace(event.contextId,
+                                      trace->getContexts(event.contextId));
+    }
+    bool hasKernelMetrics = false, hasCycleMetrics = false;
 
     auto processMetricMaps =
-        [&](size_t owningEventId, const DataEntry::MetricMap &metrics,
+        [&](size_t eventId, const DataEntry::MetricMap &metrics,
             const DataEntry::FlexibleMetricMap *flexibleMetrics,
             const std::vector<Context> &contexts, bool isGraphLinked) {
-          bool emittedKernel = false;
           if (auto kernelIt = metrics.find(MetricKind::Kernel);
               kernelIt != metrics.end()) {
             auto *kernelMetric =
                 static_cast<KernelMetric *>(kernelIt->second.get());
-            const auto isMetricKernel = std::get<uint64_t>(
-                kernelMetric->getValue(KernelMetric::IsMetricKernel));
-            const auto streamId = std::get<uint64_t>(
-                kernelMetric->getValue(KernelMetric::StreamId));
-            const auto launchScopeEventId =
-                resolveLaunchScopeEventId(owningEventId, contexts, events,
-                                          eventIdToContexts);
-            auto kernelContexts = contexts;
-            size_t graphScopeStartIndex = 0;
-            if (launchScopeEventId != TraceData::Trace::TraceEvent::DummyId) {
-              auto launchScopeContextsIt =
-                  eventIdToContexts.find(launchScopeEventId);
-              if (launchScopeContextsIt != eventIdToContexts.end()) {
-                graphScopeStartIndex = launchScopeContextsIt->second.size();
-                kernelContexts = normalizeKernelContextsForLaunchScope(
-                    contexts, launchScopeContextsIt->second);
-              }
-            }
-            if (isGraphLinked) {
-              kernelContexts = normalizeGraphKernelContextsForTrace(kernelContexts);
-            }
-            if (isMetricKernel) {
-              orderedTraceEvents.push_back(OrderedTraceEvent::kernel(
-                  kernelMetric, flexibleMetrics, kernelContexts, owningEventId,
-                  streamId, launchScopeEventId, isGraphLinked,
-                  isMetricKernel, graphScopeStartIndex));
-            } else {
-              orderedTraceEvents.push_back(OrderedTraceEvent::kernel(
-                  kernelMetric, nullptr, kernelContexts, owningEventId, streamId,
-                  launchScopeEventId, isGraphLinked, isMetricKernel,
-                  graphScopeStartIndex));
-            }
+            auto streamId = static_cast<size_t>(std::get<uint64_t>(
+                kernelMetric->getValue(KernelMetric::StreamId)));
+            auto startTimeNs = std::get<uint64_t>(
+                kernelMetric->getValue(KernelMetric::StartTime));
+            auto &launchEventId = events.at(eventId).parentEventId;
+            kernelEvents[streamId].emplace_back(kernelMetric, flexibleMetrics,
+                                                contexts, launchEventId,
+                                                isGraphLinked);
+            minTimeStamp = std::min(minTimeStamp, startTimeNs);
             hasKernelMetrics = true;
-            emittedKernel = true;
           }
           if (auto cycleIt = metrics.find(MetricKind::Cycle);
               cycleIt != metrics.end()) {
@@ -1477,61 +952,55 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
             cycleEvents.emplace_back(cycleMetric, contexts);
             hasCycleMetrics = true;
           }
-          return emittedKernel;
         };
 
     for (const auto &[_, event] : events) {
-      const auto &baseContexts = eventIdToContexts.at(event.id);
-      processMetricMaps(event.id, event.metricSet.metrics,
-                        &event.metricSet.flexibleMetrics, baseContexts,
-                        /*isGraphLinked=*/false);
-      std::vector<size_t> sortedLinkedTargetEntryIds;
-      sortedLinkedTargetEntryIds.reserve(event.metricSet.linkedMetrics.size());
-      for (const auto &[targetEntryId, _] : event.metricSet.linkedMetrics) {
-        sortedLinkedTargetEntryIds.push_back(targetEntryId);
-      }
-      std::sort(sortedLinkedTargetEntryIds.begin(),
-                sortedLinkedTargetEntryIds.end());
-      for (const auto targetEntryId : sortedLinkedTargetEntryIds) {
-        const auto &linkedMetrics =
-            event.metricSet.linkedMetrics.at(targetEntryId);
-        auto contexts = baseContexts;
-        auto &virtualContexts = targetIdToVirtualContexts[targetEntryId];
-        contexts.insert(contexts.end(), virtualContexts.begin(),
-                        virtualContexts.end());
-        const DataEntry::FlexibleMetricMap *flexibleMetrics = nullptr;
-        auto iter = event.metricSet.linkedFlexibleMetrics.find(targetEntryId);
-        if (iter != event.metricSet.linkedFlexibleMetrics.end()) {
-          flexibleMetrics = &iter->second;
+      if (event.hasCpuTimeRange()) { // CPU scope event
+        cpuScopeEvents[event.threadId].emplace_back(
+            event.metricSet.flexibleMetrics.empty()
+                ? nullptr
+                : &event.metricSet.flexibleMetrics,
+            contextIdToContexts.at(event.contextId), event.threadId,
+            event.cpuStartTimeNs, event.cpuEndTimeNs);
+        minTimeStamp = std::min(minTimeStamp, event.cpuStartTimeNs);
+      } else { // Kernel or cycle event
+        const auto &baseContexts = contextIdToContexts.at(event.contextId);
+        processMetricMaps(event.id, event.metricSet.metrics,
+                          &event.metricSet.flexibleMetrics, baseContexts,
+                          /*isGraphLinked=*/false);
+        for (const auto &[targetEntryId, _] : event.metricSet.linkedMetrics) {
+          const auto &linkedMetrics =
+              event.metricSet.linkedMetrics.at(targetEntryId);
+          // Combine the base contexts and virtual contexts to
+          // form the complete contexts for the linked metrics.
+          auto contexts = baseContexts;
+          auto &virtualContexts = targetIdToVirtualContexts[targetEntryId];
+          contexts.insert(contexts.end(), virtualContexts.begin(),
+                          virtualContexts.end());
+          // Not all kernels are associated with a flexible metric
+          const DataEntry::FlexibleMetricMap *flexibleMetrics = nullptr;
+          auto iter = event.metricSet.linkedFlexibleMetrics.find(targetEntryId);
+          if (iter != event.metricSet.linkedFlexibleMetrics.end()) {
+            flexibleMetrics = &iter->second;
+          }
+          processMetricMaps(event.id, linkedMetrics, flexibleMetrics, contexts,
+                            /*isGraphLinked=*/true);
         }
-        processMetricMaps(event.id, linkedMetrics, flexibleMetrics, contexts,
-                          /*isGraphLinked=*/true);
-      }
-      if (hasKernelMetrics && hasCycleMetrics) {
-        throw std::runtime_error("only one active metric type is supported");
+        if (hasKernelMetrics && hasCycleMetrics) {
+          throw std::runtime_error("only one active metric type is supported");
+        }
       }
     }
-    for (const auto &[eventId, event] : events) {
-      if (event.scopeId == Scope::DummyScopeId || !event.hasCpuTimeRange()) {
-        continue;
-      }
-      orderedTraceEvents.push_back(OrderedTraceEvent::cpuScope(
-          event.metricSet.flexibleMetrics.empty() ? nullptr
-                                                  : &event.metricSet.flexibleMetrics,
-          eventIdToContexts.at(eventId), event.threadId, event.cpuStartTimeNs,
-          event.cpuEndTimeNs));
-      hasCpuScopeEvents = true;
-    }
-
-    reconstructGraphScopeEvents(orderedTraceEvents, events);
 
     if (hasCycleMetrics) {
       dumpCycleMetricTrace(cycleEvents, os);
       return;
     }
 
-    if (hasKernelMetrics || hasCpuScopeEvents) {
-      dumpKernelMetricTrace(orderedTraceEvents, events, os);
+    if (hasKernelMetrics) {
+      reconstructGraphScopeEvents(kernelEvents, graphScopeEvents);
+      dumpKernelMetricTrace(minTimeStamp, kernelEvents, cpuScopeEvents,
+                            graphScopeEvents, os);
     } else {
       os << json({{"displayTimeUnit", "us"}, {"traceEvents", json::array()}})
                 .dump()

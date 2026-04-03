@@ -65,6 +65,11 @@ struct GluonInferLayoutInterface : public triton::DialectInferLayoutInterface {
     return success();
   }
 
+  LogicalResult verifyNotExpensiveView(Type, Type,
+                                       std::optional<Location>) const override {
+    return success();
+  }
+
   LogicalResult
   verifyLayoutsAreEqual(ArrayRef<int64_t> shape, Attribute expected,
                         Attribute got,

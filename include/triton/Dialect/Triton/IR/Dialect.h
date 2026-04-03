@@ -65,6 +65,12 @@ public:
                          ArrayRef<int64_t> dstShape, Attribute &dstEnc,
                          std::optional<Location> loc) const = 0;
 
+  // Verify that a view between the two types can be implemented without data
+  // movement.
+  virtual LogicalResult
+  verifyNotExpensiveView(Type srcType, Type dstType,
+                         std::optional<Location> loc) const = 0;
+
   // Check if two layouts are structurally the same, even if their names are
   // different
   virtual LogicalResult

@@ -912,15 +912,21 @@ LogicalResult ReshapeOp::verify() {
                      "encodings, or (b) neither does.");
   }
 
-  if (!srcEnc || getAllowReorder()) {
+  if (!srcEnc) {
     return success();
+  }
+
+  auto layoutInterface =
+      cast<DialectInferLayoutInterface>(&srcEnc.getDialect());
+  if (getAllowReorder()) {
+    // Since reordering is allowed, the layouts don't have to match exactly, but
+    // they still shouldn't produce any data movement.
+    return layoutInterface->verifyNotExpensiveView(srcTy, dstTy, getLoc());
   }
 
   // Check that we can infer the dst encoding from the src encoding
   // and that the inferred dst encoding is the same as the given dst encoding
   Attribute inferredDstEnc;
-  auto layoutInterface =
-      cast<DialectInferLayoutInterface>(&srcEnc.getDialect());
   auto result = layoutInterface->inferReshapeOpEncoding(
       srcTy.getShape(), srcEnc, dstTy.getShape(), inferredDstEnc, getLoc());
   if (failed(result))

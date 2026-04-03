@@ -3264,6 +3264,14 @@ struct TritonGPUInferLayoutInterface
   }
 
   LogicalResult
+  verifyNotExpensiveView(Type srcType, Type dstType,
+                         std::optional<Location> loc) const override {
+    if (isExpensiveView(srcType, dstType))
+      return emitOptionalError(loc, "Reshape must be free.");
+    return success();
+  }
+
+  LogicalResult
   verifyLayoutsAreEqual(ArrayRef<int64_t> shape, Attribute expected,
                         Attribute got,
                         std::optional<Location> loc) const override {

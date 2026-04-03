@@ -573,6 +573,7 @@ void reconstructGraphScopeEvents(
     std::map<size_t, std::vector<GraphScopeEvent>> &graphScopeEvents) {
   std::map</*stream_id=*/size_t, std::deque<OpenGraphScope>> openGraphScopes;
   for (const auto &[streamId, streamKernelEvents] : kernelEvents) {
+    uint64_t lastEndTimeNs = 0;
     for (const auto &kernelEvent : streamKernelEvents) {
       if (!kernelEvent.isGraphLinked)
         continue;
@@ -582,6 +583,7 @@ void reconstructGraphScopeEvents(
           kernelEvent.kernelMetric->getValue(KernelMetric::StartTime));
       auto endTimeNs = std::get<uint64_t>(
           kernelEvent.kernelMetric->getValue(KernelMetric::EndTime));
+      lastEndTimeNs = std::max(lastEndTimeNs, endTimeNs);
       // A streaming algorithm to find start and end time of graph scopes based on common context prefix
       if (openScopes.empty()) {
         // There's no open graph scope, we start a new stack of scopes
@@ -598,9 +600,9 @@ void reconstructGraphScopeEvents(
           }
           if (numCommonPrefixes < tailOpenScope.contexts->size()) {
             // Partial common prefix
-            graphScopeEvents[streamId].push_back({*tailOpenScope.contexts,
-                                                  tailOpenScope.startTimeNs,
-                                                  startTimeNs});
+            graphScopeEvents[streamId].push_back(
+                {*tailOpenScope.contexts, streamId, tailOpenScope.startTimeNs,
+                 startTimeNs});
             openScopes.pop_back();
           } else {
             if (numCommonPrefixes == contexts.size()) {
@@ -617,6 +619,15 @@ void reconstructGraphScopeEvents(
         }
       }
     }
+
+    auto &openScopes = openGraphScopes[streamId];
+    while (!openScopes.empty()) {
+      auto &tailOpenScope = openScopes.back();
+      graphScopeEvents[streamId].push_back(
+          {*tailOpenScope.contexts, streamId, tailOpenScope.startTimeNs,
+           lastEndTimeNs});
+      openScopes.pop_back();
+    }
   }
 }
 
@@ -624,17 +635,6 @@ void dumpKernelEvents(
     uint64_t minTimeStamp,
     std::map<size_t, std::vector<KernelEvent>> &kernelEvents,
     json &object, std::ostream &os) {
-  // Sort all events in order
-  for (auto &[streamId, events] : kernelEvents) {
-    std::sort(events.begin(), events.end(),
-              [](const KernelEvent &a, const KernelEvent &b) {
-                auto aStartTime = std::get<uint64_t>(
-                    a.kernelMetric->getValue(KernelMetric::StartTime));
-                auto bStartTime = std::get<uint64_t>(
-                    b.kernelMetric->getValue(KernelMetric::StartTime));
-                return aStartTime < bStartTime;
-              });
-  }
   for (auto const &[streamId, events] : kernelEvents) {
     for (const auto &event : events) {
       auto *kernelMetric = event.kernelMetric;
@@ -673,12 +673,6 @@ void dumpCpuScopeEvents(
     uint64_t minTimeStamp,
     std::map<size_t, std::vector<CpuScopeEvent>> &cpuScopeEvents,
     json &object, std::ostream &os) {
-  for (auto &[threadId, events] : cpuScopeEvents) {
-    std::sort(events.begin(), events.end(),
-              [](const CpuScopeEvent &a, const CpuScopeEvent &b) {
-                return a.startTimeNs < b.startTimeNs;
-              });
-  }
   for (const auto &[threadId, events] : cpuScopeEvents) {
     for (const auto &event : events) {
       const auto *flexibleMetrics = event.flexibleMetrics;
@@ -917,6 +911,25 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
     }
 
     if (hasKernelMetrics) {
+      // Sort all kernel events in order
+      for (auto &[streamId, events] : kernelEvents) {
+        std::sort(events.begin(), events.end(),
+                  [](const KernelEvent &a, const KernelEvent &b) {
+                    auto aStartTime = std::get<uint64_t>(
+                        a.kernelMetric->getValue(KernelMetric::StartTime));
+                    auto bStartTime = std::get<uint64_t>(
+                        b.kernelMetric->getValue(KernelMetric::StartTime));
+                    return aStartTime < bStartTime;
+                  });
+      }
+      // Sort CPU scope events by start time
+      for (auto &[threadId, events] : cpuScopeEvents) {
+        std::sort(events.begin(), events.end(),
+                  [](const CpuScopeEvent &a, const CpuScopeEvent &b) {
+                    return a.startTimeNs < b.startTimeNs;
+                  });
+      }
+      // Graph scopes are constructed in order
       reconstructGraphScopeEvents(kernelEvents, graphScopeEvents);
       dumpKernelMetricTrace(minTimeStamp, kernelEvents, cpuScopeEvents,
                             graphScopeEvents, os);

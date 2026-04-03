@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <deque>
 #include <functional>
 #include <iterator>
 #include <limits>
@@ -317,7 +316,7 @@ struct CpuScopeEvent {
 };
 
 struct GraphScopeEvent {
-  std::vector<Context> contexts;
+  Context context;
   size_t streamId{};
   uint64_t startTimeNs{};
   uint64_t endTimeNs{};
@@ -532,6 +531,12 @@ json buildCallStackJson(const std::vector<Context> &contexts) {
   return callStack;
 }
 
+json buildCallStackJson(const Context &context) {
+  json callStack = json::array();
+  callStack.push_back(context.name);
+  return callStack;
+}
+
 json buildFlexibleMetricsJson(
     const DataEntry::FlexibleMetricMap &flexibleMetrics) {
   json metrics = json::object();
@@ -548,6 +553,23 @@ buildFlexibleMetricEventName(const std::vector<Context> &contexts,
       contexts.empty() ? GraphState::metricTag : contexts.back().name;
   std::ostringstream ss;
   ss << scopeName << ": ";
+  bool isFirst = true;
+  for (const auto &[metricName, metricValue] : flexibleMetrics) {
+    if (!isFirst) {
+      ss << ", ";
+    }
+    ss << "<" << metricName << ", "
+       << formatFlexibleMetricValue(metricValue.getValues()[0]) << ">";
+    isFirst = false;
+  }
+  return ss.str();
+}
+
+std::string buildFlexibleMetricEventName(
+    const Context &context,
+    const DataEntry::FlexibleMetricMap &flexibleMetrics) {
+  std::ostringstream ss;
+  ss << context.name << ": ";
   bool isFirst = true;
   for (const auto &[metricName, metricValue] : flexibleMetrics) {
     if (!isFirst) {
@@ -630,10 +652,10 @@ void reconstructGraphScopeEvents(
     const std::map<size_t, std::vector<KernelEvent>> &kernelEvents,
     std::map<size_t, std::vector<GraphScopeEvent>> &graphScopeEvents) {
   struct OpenGraphScope {
-    const std::vector<Context> *contexts{};
+    Context context;
     uint64_t startTimeNs{};
   };
-  std::map</*stream_id=*/size_t, std::deque<OpenGraphScope>> openGraphScopes;
+  std::map</*stream_id=*/size_t, std::vector<OpenGraphScope>> openGraphScopes;
   for (const auto &[streamId, streamKernelEvents] : kernelEvents) {
     uint64_t lastEndTimeNs = 0;
     for (const auto &kernelEvent : streamKernelEvents) {
@@ -645,51 +667,68 @@ void reconstructGraphScopeEvents(
           kernelEvent.kernelMetric->getValue(KernelMetric::StartTime));
       auto endTimeNs = std::get<uint64_t>(
           kernelEvent.kernelMetric->getValue(KernelMetric::EndTime));
-      lastEndTimeNs = std::max(lastEndTimeNs, endTimeNs);
       // A streaming algorithm to find start and end time of graph scopes based
       // on common context prefix
       if (openScopes.empty()) {
         // There's no open graph scope, we start a new stack of scopes
-        openScopes.push_back({&contexts, startTimeNs});
-      } else {
-        while (!openScopes.empty()) {
-          auto &tailOpenScope = openScopes.back();
-          auto numCommonPrefixes = 0;
-          for (size_t i = 0;
-               i < tailOpenScope.contexts->size() && i < contexts.size(); ++i) {
-            if (tailOpenScope.contexts->at(i).name != contexts[i].name)
-              break;
-            numCommonPrefixes++;
+        bool seenCaptureTag = false;
+        for (const auto &context : contexts) {
+          if (context.name == GraphState::captureTag) {
+            seenCaptureTag = true;
+          } else if (context.name == GraphState::metricTag ||
+                     context.name == GraphState::metadataTag) {
+            break;
           }
-          if (numCommonPrefixes < tailOpenScope.contexts->size()) {
-            // Partial common prefix
-            graphScopeEvents[streamId].push_back(
-                {*tailOpenScope.contexts, streamId, tailOpenScope.startTimeNs,
-                 startTimeNs});
-            openScopes.pop_back();
-          } else {
-            if (numCommonPrefixes == contexts.size()) {
-              // The new kernel's context is exactly the same as the open scope,
-              // we keep the existing scope
-              break;
-            } else {
-              // The new kernel's context is a super set of the open scope, we
-              // start a new scope on top of the existing one
-              openScopes.push_back({&contexts, startTimeNs});
-              break;
-            }
+          if (seenCaptureTag) {
+            openScopes.push_back({context, startTimeNs});
           }
         }
+      } else {
+        auto numCommonPrefixes = 0;
+        auto captureTagIdx = -1;
+        for (size_t i = 0; i < openScopes.size(); ++i) {
+          if (openScopes[i].context.name == GraphState::captureTag) {
+            captureTagIdx = i;
+            break;
+          }
+        }
+        if (captureTagIdx == -1)
+          throw std::runtime_error("Invalid open graph scope without capture tag");
+        for (size_t i = 0; i < openScopes.size(); ++i) {
+          if (openScopes[i].context != contexts[i + captureTagIdx] ||
+              i + captureTagIdx >= contexts.size())
+            break;
+          numCommonPrefixes++;
+        }
+        for (size_t i = numCommonPrefixes; i < openScopes.size(); ++i) {
+          // Close scopes that are not in the common prefix
+          auto &tailOpenScope = openScopes[i];
+          graphScopeEvents[streamId].push_back(
+              {tailOpenScope.context, streamId,
+               tailOpenScope.startTimeNs, lastEndTimeNs});
+        }
+        for (size_t i = numCommonPrefixes; i < openScopes.size(); ++i) {
+          // Remove scopes that are not in the common prefix
+          openScopes.pop_back();
+        }
+        for (size_t i = numCommonPrefixes + captureTagIdx; i < contexts.size();
+             ++i) {
+          // Open scopes that are not in the common prefix
+          const auto &context = contexts[i];
+          if (context.name == GraphState::metricTag ||
+              context.name == GraphState::metadataTag) {
+            break;
+          }
+          openScopes.push_back({context, startTimeNs});
+        }
       }
+      lastEndTimeNs = std::max(lastEndTimeNs, endTimeNs);
     }
 
     auto &openScopes = openGraphScopes[streamId];
-    while (!openScopes.empty()) {
-      auto &tailOpenScope = openScopes.back();
-      graphScopeEvents[streamId].push_back({*tailOpenScope.contexts, streamId,
-                                            tailOpenScope.startTimeNs,
-                                            lastEndTimeNs});
-      openScopes.pop_back();
+    for (const auto &openScope : openScopes) {
+      graphScopeEvents[streamId].push_back(
+          {openScope.context, streamId, openScope.startTimeNs, lastEndTimeNs});
     }
   }
 }
@@ -776,11 +815,11 @@ void dumpGraphScopeEvents(
       json element;
       if (event.flexibleMetrics != nullptr && !event.flexibleMetrics->empty()) {
         element["name"] = buildFlexibleMetricEventName(
-            event.contexts, *event.flexibleMetrics);
+            event.context, *event.flexibleMetrics);
         element["cat"] = "metric";
         element["args"]["metrics"] = buildFlexibleMetricsJson(*event.flexibleMetrics);
       } else {
-        element["name"] = event.contexts.back().name;
+        element["name"] = event.context.name;
         element["cat"] = "scope";
       }
       element["ph"] = "X";
@@ -789,7 +828,7 @@ void dumpGraphScopeEvents(
       element["dur"] =
           static_cast<double>(event.endTimeNs - event.startTimeNs) / 1000.0;
       element["tid"] = graphTid;
-      element["args"]["call_stack"] = buildCallStackJson(event.contexts);
+      element["args"]["call_stack"] = buildCallStackJson(event.context);
       object["traceEvents"].push_back(std::move(element));
     }
   }

@@ -919,7 +919,10 @@ void dumpCpuToGraphFlowEvents(
       const auto launchMidTimeNs =
           launchEvent->startTimeNs +
           (launchEvent->endTimeNs - launchEvent->startTimeNs) / 2;
-      const auto flowStartTimeNs = std::min(launchMidTimeNs, event.startTimeNs);
+      const auto flowFinishTimeNs =
+          event.endTimeNs > event.startTimeNs ? event.endTimeNs - 1
+                                              : event.startTimeNs;
+      const auto flowStartTimeNs = std::min(launchMidTimeNs, flowFinishTimeNs);
 
       json startElement;
       startElement["name"] = "launch->graph";
@@ -940,7 +943,7 @@ void dumpCpuToGraphFlowEvents(
       finishElement["pid"] = kTraceProcessId;
       finishElement["tid"] = getGraphLaneId(streamId);
       finishElement["ts"] =
-          static_cast<double>(event.startTimeNs - minTimeStamp) / 1000.0;
+          static_cast<double>(flowFinishTimeNs - minTimeStamp) / 1000.0;
       finishElement["id"] = event.launchEventId;
       finishElement["bp"] = "e";
       object["traceEvents"].push_back(std::move(finishElement));
@@ -1034,8 +1037,9 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
             auto startTimeNs = std::get<uint64_t>(
                 kernelMetric->getValue(KernelMetric::StartTime));
             auto launchEventId = events.at(eventId).parentEventId;
-            while (launchEventId != Trace::Event::DummyId &&
-                   !events.at(launchEventId).hasCpuTimeRange()) {
+            if (isGraphLinked) {
+              // For graph-linked kernels, the parent is the <captured_at> tag.
+              // So we need to go one level up to find the actual launch event
               launchEventId = events.at(launchEventId).parentEventId;
             }
             kernelEvents[streamId].emplace_back(kernelMetric, flexibleMetrics,

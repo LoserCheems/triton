@@ -916,13 +916,8 @@ void dumpCpuToGraphFlowEvents(
       }
 
       const auto *launchEvent = launchEventIt->second;
-      const auto launchMidTimeNs =
-          launchEvent->startTimeNs +
-          (launchEvent->endTimeNs - launchEvent->startTimeNs) / 2;
-      const auto flowFinishTimeNs =
-          event.endTimeNs > event.startTimeNs ? event.endTimeNs - 1
-                                              : event.startTimeNs;
-      const auto flowStartTimeNs = std::min(launchMidTimeNs, flowFinishTimeNs);
+      const auto flowFinishTimeNs = event.endTimeNs - 1;
+      const auto flowStartTimeNs = launchEvent->startTimeNs;
 
       json startElement;
       startElement["name"] = "launch->graph";

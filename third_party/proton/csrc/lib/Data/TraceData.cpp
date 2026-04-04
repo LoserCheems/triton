@@ -1033,7 +1033,11 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
                 kernelMetric->getValue(KernelMetric::StreamId)));
             auto startTimeNs = std::get<uint64_t>(
                 kernelMetric->getValue(KernelMetric::StartTime));
-            auto &launchEventId = events.at(eventId).parentEventId;
+            auto launchEventId = events.at(eventId).parentEventId;
+            while (launchEventId != Trace::Event::DummyId &&
+                   !events.at(launchEventId).hasCpuTimeRange()) {
+              launchEventId = events.at(launchEventId).parentEventId;
+            }
             kernelEvents[streamId].emplace_back(kernelMetric, flexibleMetrics,
                                                 contexts, launchEventId,
                                                 isGraphLinked);

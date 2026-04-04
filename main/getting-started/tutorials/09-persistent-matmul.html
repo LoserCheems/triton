@@ -162,13 +162,13 @@ Benchmarking naive: ...
 Benchmarking naive: done
 Benchmarking persistent: ...
 Benchmarking persistent: done
-nan 15861.563 ROOT
-├─ 175.256 3921.081 cuBLAS [M=8192, N=8192, K=512]
-│  └─ nan 3921.081 ampere_fp16_s16816gemm_fp16_128x128_ldg8_f2f_stages_32x5_tn
-├─ 175.962 3905.369 matmul_kernel [M=8192, N=8192, K=512]
-├─ 166.704 4122.257 matmul_kernel_persistent [M=8192, N=8192, K=512]
-└─ 175.625 3912.857 torch [M=8192, N=8192, K=512]
-   └─ nan 3912.857 ampere_fp16_s16816gemm_fp16_128x128_ldg8_f2f_stages_32x5_tn
+nan 15783.568 ROOT
+├─ 176.302 3897.835 cuBLAS [M=8192, N=8192, K=512]
+│  └─ nan 3897.835 ampere_fp16_s16816gemm_fp16_128x128_ldg8_f2f_stages_32x5_tn
+├─ 176.672 3889.661 matmul_kernel [M=8192, N=8192, K=512]
+├─ 167.355 4106.216 matmul_kernel_persistent [M=8192, N=8192, K=512]
+└─ 176.663 3889.856 torch [M=8192, N=8192, K=512]
+   └─ nan 3889.856 ampere_fp16_s16816gemm_fp16_128x128_ldg8_f2f_stages_32x5_tn
 </pre></div>
 </div>
 <div class="line-block">
@@ -913,7 +913,7 @@ nan 15861.563 ROOT
         <span class="n">show_profile</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">prec</span><span class="p">,</span> <span class="s2">&quot;matmul&quot;</span><span class="p">)</span>
 </pre></div>
 </div>
-<p class="sphx-glr-timing"><strong>Total running time of the script:</strong> (1 minutes 31.769 seconds)</p>
+<p class="sphx-glr-timing"><strong>Total running time of the script:</strong> (1 minutes 37.756 seconds)</p>
 <div class="sphx-glr-footer sphx-glr-footer-example docutils container" id="sphx-glr-download-getting-started-tutorials-09-persistent-matmul-py">
 <div class="sphx-glr-download sphx-glr-download-jupyter docutils container">
 <p><a class="reference download internal" download="" href="../../_downloads/b5537c431cd73b8ee3c32cdf90c58104/09-persistent-matmul.ipynb"><code class="xref download docutils literal notranslate"><span class="pre">Download</span> <span class="pre">Jupyter</span> <span class="pre">notebook:</span> <span class="pre">09-persistent-matmul.ipynb</span></code></a></p>

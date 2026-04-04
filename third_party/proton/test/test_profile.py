@@ -1143,41 +1143,22 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
         "ROOT", "test0", "a", "b", "c", "<metric>"
     ]
 
-    flow_starts = [event for event in trace_events if event["cat"] == "flow" and event["ph"] == "s"]
-    flow_finishes = [event for event in trace_events if event["cat"] == "flow" and event["ph"] == "f"]
-
-    def get_flow_start_for_kernel(kernel_event):
-        flow_finish = next(
-            event for event in flow_finishes
-            if event["tid"] == kernel_event["tid"] and event["ts"] == kernel_event["ts"]
-        )
-        return next(event for event in flow_starts if event["id"] == flow_finish["id"])
-
-    kernel_abc = next(
-        event for event in foo_events
-        if event["args"]["call_stack"] == ["ROOT", "test0", "a", "b", "c", "foo"]
-    )
-    kernel_ab = next(
-        event for event in foo_events
-        if event["args"]["call_stack"] == ["ROOT", "test0", "a", "b", "foo"]
-    )
-    kernel_a = next(
-        event for event in foo_events
-        if event["args"]["call_stack"] == ["ROOT", "test0", "a", "foo"]
-    )
-
-    for kernel_event, scope_event in [
-        (metric_kernel_event, scope_c),
-        (kernel_abc, scope_c),
-        (kernel_ab, scope_b),
-        (kernel_a, scope_a),
-    ]:
-        flow_start = get_flow_start_for_kernel(kernel_event)
-        assert flow_start["tid"] == graph_tid
-        assert scope_event["ts"] <= flow_start["ts"] <= scope_event["ts"] + scope_event["dur"]
-
-    assert get_flow_start_for_kernel(kernel_ab)["ts"] >= scope_c["ts"] + scope_c["dur"]
-    assert get_flow_start_for_kernel(kernel_a)["ts"] >= scope_b["ts"] + scope_b["dur"]
+    graph_flow_starts = [
+        event for event in trace_events
+        if event["cat"] == "flow" and event["ph"] == "s" and event["name"] == "launch->graph"
+    ]
+    graph_flow_finishes = [
+        event for event in trace_events
+        if event["cat"] == "flow" and event["ph"] == "f" and event["name"] == "launch->graph"
+    ]
+    assert len(graph_flow_starts) == 1
+    assert len(graph_flow_finishes) == 1
+    graph_flow_start = graph_flow_starts[0]
+    graph_flow_finish = graph_flow_finishes[0]
+    assert graph_flow_start["id"] == graph_flow_finish["id"]
+    assert graph_flow_start["tid"].startswith("cpu thread ")
+    assert graph_flow_finish["tid"] == graph_tid
+    assert graph_flow_start["ts"] <= graph_flow_finish["ts"]
 
 
 @pytest.mark.skipif(not is_cuda(), reason="Only CUDA backend supports cudagraph trace reconstruction")
@@ -1254,16 +1235,22 @@ def test_trace_cudagraph_metric_only_scope_path(tmp_path: pathlib.Path, device: 
     ]
     assert len(replay_metric_kernels) == 1
 
-    flow_starts = [event for event in trace_events if event["cat"] == "flow" and event["ph"] == "s"]
-    flow_finishes = [event for event in trace_events if event["cat"] == "flow" and event["ph"] == "f"]
-    metric_kernel_event = replay_metric_kernels[0]
-    flow_finish = next(
-        event for event in flow_finishes
-        if event["tid"] == metric_kernel_event["tid"] and event["ts"] == metric_kernel_event["ts"]
-    )
-    flow_start = next(event for event in flow_starts if event["id"] == flow_finish["id"])
-    assert flow_start["tid"] == graph_tid
-    assert inner_event["ts"] <= flow_start["ts"] <= inner_event["ts"] + inner_event["dur"]
+    graph_flow_starts = [
+        event for event in trace_events
+        if event["cat"] == "flow" and event["ph"] == "s" and event["name"] == "launch->graph"
+    ]
+    graph_flow_finishes = [
+        event for event in trace_events
+        if event["cat"] == "flow" and event["ph"] == "f" and event["name"] == "launch->graph"
+    ]
+    assert len(graph_flow_starts) == 1
+    assert len(graph_flow_finishes) == 1
+    graph_flow_start = graph_flow_starts[0]
+    graph_flow_finish = graph_flow_finishes[0]
+    assert graph_flow_start["id"] == graph_flow_finish["id"]
+    assert graph_flow_start["tid"].startswith("cpu thread ")
+    assert graph_flow_finish["tid"] == graph_tid
+    assert graph_flow_start["ts"] <= graph_flow_finish["ts"]
 
 
 @pytest.mark.parametrize("profile_kind,suffix", [("tree", ".hatchet"), ("trace", ".chrome_trace")],

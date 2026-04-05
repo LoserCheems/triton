@@ -172,11 +172,10 @@ void TraceData::enterScope(const Scope &scope) {
   else
     contexts.push_back(scope.name);
   auto &activeEventStack = traceDataToActiveEventStack[this];
-  size_t parentEventId =
-      activeEventStack.empty() ? Trace::Event::DummyId
-                               : activeEventStack.back();
-  auto eventId =
-      currentTrace->addEvent(currentTrace->addContexts(contexts), parentEventId);
+  size_t parentEventId = activeEventStack.empty() ? Trace::Event::DummyId
+                                                  : activeEventStack.back();
+  auto eventId = currentTrace->addEvent(currentTrace->addContexts(contexts),
+                                        parentEventId);
   auto &event = currentTrace->getEvent(eventId);
   event.scopeId = scope.scopeId;
   event.cpuStartTimeNs = getCurrentCpuTimestampNs();
@@ -295,10 +294,13 @@ struct KernelEvent {
   size_t launchEventId{};
   bool isGraphLinked{};
 
-  KernelEvent(const KernelMetric *metric, const DataEntry::FlexibleMetricMap *metrics,
-              std::vector<Context> contexts, size_t launchId, bool isGraphLinked)
-      : kernelMetric(metric), flexibleMetrics(metrics), contexts(std::move(contexts)),
-        launchEventId(launchId), isGraphLinked(isGraphLinked) {}
+  KernelEvent(const KernelMetric *metric,
+              const DataEntry::FlexibleMetricMap *metrics,
+              std::vector<Context> contexts, size_t launchId,
+              bool isGraphLinked)
+      : kernelMetric(metric), flexibleMetrics(metrics),
+        contexts(std::move(contexts)), launchEventId(launchId),
+        isGraphLinked(isGraphLinked) {}
 };
 
 struct CpuScopeEvent {
@@ -500,8 +502,8 @@ std::string formatFlexibleMetricValue(const MetricValueType &value) {
   return std::visit(
       [](auto &&v) -> std::string {
         using T = std::decay_t<decltype(v)>;
-        if constexpr (std::is_same_v<T, uint64_t> || std::is_same_v<T, int64_t> ||
-                      std::is_same_v<T, double>) {
+        if constexpr (std::is_same_v<T, uint64_t> ||
+                      std::is_same_v<T, int64_t> || std::is_same_v<T, double>) {
           return std::to_string(v);
         } else if constexpr (std::is_same_v<T, std::string>) {
           return v;
@@ -548,9 +550,9 @@ json buildFlexibleMetricsJson(
   return metrics;
 }
 
-std::string
-buildFlexibleMetricEventName(const std::vector<Context> &contexts,
-                             const DataEntry::FlexibleMetricMap &flexibleMetrics) {
+std::string buildFlexibleMetricEventName(
+    const std::vector<Context> &contexts,
+    const DataEntry::FlexibleMetricMap &flexibleMetrics) {
   const auto &scopeName =
       contexts.empty() ? GraphState::metricTag : contexts.back().name;
   std::ostringstream ss;
@@ -610,7 +612,8 @@ void appendThreadMetadata(json &traceEvents, uint64_t tid,
 }
 
 void emitTraceLaneMetadata(
-    json &object, const std::map<size_t, std::vector<CpuScopeEvent>> &cpuScopeEvents,
+    json &object,
+    const std::map<size_t, std::vector<CpuScopeEvent>> &cpuScopeEvents,
     const std::map<size_t, std::vector<GraphScopeEvent>> &graphScopeEvents,
     const std::map<size_t, std::vector<KernelEvent>> &kernelEvents) {
   auto &traceEvents = object["traceEvents"];
@@ -697,7 +700,8 @@ void reconstructGraphScopeEvents(
       if (openScopes.empty()) {
         // There's no open graph scope, we start a new stack of scopes
         for (const auto &context : graphContexts) {
-          openScopes.push_back({context, kernelEvent.launchEventId, startTimeNs});
+          openScopes.push_back(
+              {context, kernelEvent.launchEventId, startTimeNs});
         }
       } else {
         auto numCommonPrefixes = 0;
@@ -723,7 +727,8 @@ void reconstructGraphScopeEvents(
         for (size_t i = numCommonPrefixes; i < graphContexts.size(); ++i) {
           // Open scopes that are not in the common prefix
           const auto &context = graphContexts[i];
-          openScopes.push_back({context, kernelEvent.launchEventId, startTimeNs});
+          openScopes.push_back(
+              {context, kernelEvent.launchEventId, startTimeNs});
         }
       }
       lastEndTimeNs = std::max(lastEndTimeNs, endTimeNs);
@@ -778,8 +783,8 @@ void dumpKernelEvents(uint64_t minTimeStamp,
 
 void dumpCpuScopeEvents(
     uint64_t minTimeStamp,
-    std::map<size_t, std::vector<CpuScopeEvent>> &cpuScopeEvents,
-    json &object, std::ostream &os) {
+    std::map<size_t, std::vector<CpuScopeEvent>> &cpuScopeEvents, json &object,
+    std::ostream &os) {
   for (const auto &[threadId, events] : cpuScopeEvents) {
     for (const auto &event : events) {
       const auto *flexibleMetrics = event.flexibleMetrics;
@@ -819,17 +824,19 @@ void dumpGraphScopeEvents(
     for (const auto &event : events) {
       json element;
       if (event.flexibleMetrics != nullptr && !event.flexibleMetrics->empty()) {
-        element["name"] = buildFlexibleMetricEventName(
-            event.context, *event.flexibleMetrics);
+        element["name"] =
+            buildFlexibleMetricEventName(event.context, *event.flexibleMetrics);
         element["cat"] = "metric";
-        element["args"]["metrics"] = buildFlexibleMetricsJson(*event.flexibleMetrics);
+        element["args"]["metrics"] =
+            buildFlexibleMetricsJson(*event.flexibleMetrics);
       } else {
         element["name"] = event.context.name;
         element["cat"] = "scope";
       }
       element["ph"] = "X";
       element["pid"] = kTraceProcessId;
-      element["ts"] = static_cast<double>(event.startTimeNs - minTimeStamp) / 1000.0;
+      element["ts"] =
+          static_cast<double>(event.startTimeNs - minTimeStamp) / 1000.0;
       element["dur"] =
           static_cast<double>(event.endTimeNs - event.startTimeNs) / 1000.0;
       element["tid"] = graphTid;
@@ -843,7 +850,8 @@ void dumpCpuToGpuFlowEvents(
     const std::map<size_t, std::vector<CpuScopeEvent>> &cpuScopeEvents,
     const std::map<size_t, std::vector<KernelEvent>> &kernelEvents,
     json &object) {
-  std::unordered_map<size_t, const CpuScopeEvent *> launchEventIdToCpuScopeEvent;
+  std::unordered_map<size_t, const CpuScopeEvent *>
+      launchEventIdToCpuScopeEvent;
   for (const auto &[_, events] : cpuScopeEvents) {
     for (const auto &event : events) {
       launchEventIdToCpuScopeEvent.emplace(event.eventId, &event);
@@ -856,7 +864,8 @@ void dumpCpuToGpuFlowEvents(
           event.launchEventId == std::numeric_limits<size_t>::max()) {
         continue;
       }
-      auto launchEventIt = launchEventIdToCpuScopeEvent.find(event.launchEventId);
+      auto launchEventIt =
+          launchEventIdToCpuScopeEvent.find(event.launchEventId);
       if (launchEventIt == launchEventIdToCpuScopeEvent.end()) {
         continue;
       }
@@ -897,7 +906,8 @@ void dumpCpuToGraphFlowEvents(
     const std::map<size_t, std::vector<CpuScopeEvent>> &cpuScopeEvents,
     const std::map<size_t, std::vector<GraphScopeEvent>> &graphScopeEvents,
     json &object) {
-  std::unordered_map<size_t, const CpuScopeEvent *> launchEventIdToCpuScopeEvent;
+  std::unordered_map<size_t, const CpuScopeEvent *>
+      launchEventIdToCpuScopeEvent;
   for (const auto &[_, events] : cpuScopeEvents) {
     for (const auto &event : events) {
       launchEventIdToCpuScopeEvent.emplace(event.eventId, &event);
@@ -909,7 +919,8 @@ void dumpCpuToGraphFlowEvents(
       if (event.context.name != GraphState::captureTag) {
         continue;
       }
-      auto launchEventIt = launchEventIdToCpuScopeEvent.find(event.launchEventId);
+      auto launchEventIt =
+          launchEventIdToCpuScopeEvent.find(event.launchEventId);
       if (launchEventIt == launchEventIdToCpuScopeEvent.end()) {
         continue;
       }

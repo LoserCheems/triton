@@ -954,10 +954,13 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
     metric_1 = get_metric_event("m1")
     metric_2 = get_metric_event("m2")
     metric_3 = get_metric_event("m3")
-    scope_4 = next(event for event in scope_events if event["args"]["call_stack"] == ["ROOT", "scope_3", "scope_2", "scope_4"])
-    scope_5 = next(event for event in scope_events if event["args"]["call_stack"] == ["ROOT", "scope_3", "scope_2", "scope_5"])
+    scope_4 = next(event for event in scope_events
+                   if event["args"]["call_stack"] == ["ROOT", "scope_3", "scope_2", "scope_4"])
+    scope_5 = next(event for event in scope_events
+                   if event["args"]["call_stack"] == ["ROOT", "scope_3", "scope_2", "scope_5"])
     scope_6 = next(event for event in scope_events if event["args"]["call_stack"] == ["ROOT", "scope_3", "scope_6"])
-    scope_7 = next(event for event in scope_events if event["args"]["call_stack"] == ["ROOT", "scope_3", "scope_6", "scope_7"])
+    scope_7 = next(event for event in scope_events
+                   if event["args"]["call_stack"] == ["ROOT", "scope_3", "scope_6", "scope_7"])
 
     assert metric_1["cat"] == "metric"
     assert metric_2["cat"] == "metric"
@@ -1100,9 +1103,7 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
     assert all(COMPUTE_METADATA_SCOPE_NAME not in get_call_stack(event) for event in replay_graph_events)
 
     def get_graph_scope(expected_stack):
-        event = next(
-            event for event in replay_graph_events if has_stack(event, expected_stack)
-        )
+        event = next(event for event in replay_graph_events if has_stack(event, expected_stack))
         return {
             "name": event["name"],
             "cat": event["cat"],
@@ -1128,8 +1129,7 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
     assert scope_b["ts"] + scope_b["dur"] <= scope_a["ts"] + scope_a["dur"]
 
     replay_kernel_events = [
-        event for event in trace_events
-        if event["cat"] == "kernel" and "test0" in get_call_stack(event)
+        event for event in trace_events if event["cat"] == "kernel" and "test0" in get_call_stack(event)
     ]
     assert all("<captured_at>" not in get_call_stack(event) for event in replay_kernel_events)
     assert all(COMPUTE_METADATA_SCOPE_NAME not in get_call_stack(event) for event in replay_kernel_events)
@@ -1139,9 +1139,7 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
     assert len(foo_events) == 3
     assert len(metric_kernel_events) == 1
     metric_kernel_event = metric_kernel_events[0]
-    assert metric_kernel_event["args"]["call_stack"] == [
-        "ROOT", "test0", "a", "b", "c", "<metric>"
-    ]
+    assert metric_kernel_event["args"]["call_stack"] == ["ROOT", "test0", "a", "b", "c", "<metric>"]
 
     graph_flow_starts = [
         event for event in trace_events
@@ -1206,9 +1204,7 @@ def test_trace_cudagraph_metric_only_scope_path(tmp_path: pathlib.Path, device: 
     assert all(COMPUTE_METADATA_SCOPE_NAME not in get_call_stack(event) for event in replay_graph_events)
 
     def get_graph_scope(expected_stack):
-        event = next(
-            event for event in replay_graph_events if has_stack(event, expected_stack)
-        )
+        event = next(event for event in replay_graph_events if has_stack(event, expected_stack))
         return {
             "name": event["name"],
             "cat": event["cat"],
@@ -1226,12 +1222,8 @@ def test_trace_cudagraph_metric_only_scope_path(tmp_path: pathlib.Path, device: 
     assert inner_event["args"]["metrics"] == {"metric_only": "2.000000"}
 
     replay_metric_kernels = [
-        event for event in trace_events
-        if event["cat"] == "kernel"
-        and event["name"] == "<metric>"
-        and get_call_stack(event) == [
-            "ROOT", "test0", "outer", "inner", "<metric>"
-        ]
+        event for event in trace_events if event["cat"] == "kernel" and event["name"] == "<metric>"
+        and get_call_stack(event) == ["ROOT", "test0", "outer", "inner", "<metric>"]
     ]
     assert len(replay_metric_kernels) == 1
 

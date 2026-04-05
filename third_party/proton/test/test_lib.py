@@ -122,14 +122,16 @@ def test_trace_scope_metrics_thread_lanes(tmp_path: pathlib.Path):
     trace_events = data["traceEvents"]
     assert len(trace_events) == 2
     assert len({event["tid"] for event in trace_events}) == 2
-    assert {event["name"] for event in trace_events} == {
-        "thread_a: <a, 1.000000>",
-        "thread_b: <b, 2.000000>",
-    }
-    assert {tuple(event["args"]["call_stack"]) for event in trace_events} == {
-        ("ROOT", "thread_a"),
-        ("ROOT", "thread_b"),
-    }
+    assert {event["name"]
+            for event in trace_events} == {
+                "thread_a: <a, 1.000000>",
+                "thread_b: <b, 2.000000>",
+            }
+    assert {tuple(event["args"]["call_stack"])
+            for event in trace_events} == {
+                ("ROOT", "thread_a"),
+                ("ROOT", "thread_b"),
+            }
 
 
 def test_init_function_metadata(tmp_path: pathlib.Path):

@@ -856,6 +856,10 @@ void dumpCpuToGpuFlowEvents(
   for (const auto &[streamId, events] : kernelEvents) {
     auto prevLaunchEventId = std::numeric_limits<size_t>::max();
     for (const auto &event : events) {
+      if (event.launchEventId == std::numeric_limits<size_t>::max()) {
+        // This kernel event is not linked to any CPU scope event, skip it.
+        continue;
+      }
       if (prevLaunchEventId == event.launchEventId && event.isGraphLinked) {
         // For back-to-back kernel launches linked to the same CPU scope event,
         // we only create flow events for the first one to avoid creating

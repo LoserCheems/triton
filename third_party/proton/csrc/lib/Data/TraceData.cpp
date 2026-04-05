@@ -921,7 +921,7 @@ void dumpCpuToGraphFlowEvents(
 
       const auto *launchEvent = launchEventIt->second;
       // Ensure only <captured_at> is active
-      const auto flowFinishTimeNs = event.endTimeNs + 1;
+      const auto flowFinishTimeNs = event.endTimeNs;
       const auto flowStartTimeNs = launchEvent->startTimeNs;
 
       json startElement;

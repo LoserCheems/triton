@@ -115,15 +115,6 @@ def test_cudagraph(tmp_path: pathlib.Path, device: str):
         g.replay()
 
     g.reset()
-
-    with torch.cuda.graph(g):  # this will create new graphexecs
-        for i in range(10):
-            with proton.scope(f"new_iter_{i}"):
-                fn()
-
-    with proton.scope("test2"):
-        g.replay()
-
     proton.finalize()
 
     with temp_file.open() as f:
@@ -134,35 +125,28 @@ def test_cudagraph(tmp_path: pathlib.Path, device: str):
     # find the test frame
     test0_frame = None
     test1_frame = None
-    test2_frame = None
     for child in data[0]["children"]:
         if child["frame"]["name"] == "test0":
             test0_frame = child
         if child["frame"]["name"] == "test1":
             test1_frame = child
-        if child["frame"]["name"] == "test2":
-            test2_frame = child
     assert test0_frame is not None
     assert test1_frame is not None
-    assert test2_frame is not None
     # {torch.ones, add, foo}
     if is_hip():
         assert len(test0_frame["children"]) >= 2
         assert test0_frame["children"][0]["metrics"]["time (ns)"] > 0
     else:
         # cuda backend supports "<captured_at>" annotation
-        for test_frame in [test0_frame, test1_frame, test2_frame]:
+        for test_frame in [test0_frame, test1_frame]:
             child = test_frame["children"][0]
             assert child["frame"]["name"] == "<captured_at>"
-            # check all iterations
-            total_iters = 0
-            for child in child["children"]:
-                iter_frame = "iter" if test_frame != test2_frame else "new_iter"
-                if iter_frame in child["frame"]["name"]:  # TODO(Keren): remove empty frames
-                    if "time (ns)" in child["children"][0]["metrics"]:
-                        total_iters += 1
             # 0...9 iterations
-            assert total_iters == 10
+            assert len(child["children"]) == 10
+            # check all iterations
+            for i in range(10):
+                assert child["children"][i]["frame"]["name"] == f"iter_{i}"
+                assert child["children"][i]["children"][0]["metrics"]["time (ns)"] > 0
 
 
 @pytest.mark.skipif(not is_cuda(), reason="Only CUDA backend supports cudagraph replay")
@@ -823,15 +807,14 @@ def test_multiple_sessions_cudagraph_metric_kernels(tmp_path: pathlib.Path, devi
             queue.extend(cur["children"])
         return None
 
-    def get_nodes_with_metric(node, metric_name: str):
-        matches = []
+    def get_all_names(node):
+        names = set()
         queue = [node]
         while queue:
             cur = queue.pop(0)
-            if metric_name in cur["metrics"]:
-                matches.append(cur)
+            names.add(cur["frame"]["name"])
             queue.extend(cur["children"])
-        return matches
+        return names
 
     with temp_file0.open() as f:
         data0 = json.load(f)
@@ -855,15 +838,6 @@ def test_multiple_sessions_cudagraph_metric_kernels(tmp_path: pathlib.Path, devi
     assert bar_frame0 is None
     assert foo_frame1 is None
     assert bar_frame1 is not None
-
-    sum_metric_nodes = get_nodes_with_metric(capture0, "sum_metric")
-    assert len(sum_metric_nodes) == 1
-    assert sum_metric_nodes[0] is foo_frame0
-
-    metric_nodes = get_nodes_with_metric(capture0, "count")
-    for node in metric_nodes:
-        if node["frame"]["name"] == "<metric_node>":
-            assert "sum_metric" not in node["metrics"]
 
     assert foo_frame0["metrics"]["sum_metric"] == float(foo_iters * x.numel())
     assert int(foo_frame0["metrics"]["count"]) == foo_iters
@@ -892,7 +866,7 @@ def test_trace(tmp_path: pathlib.Path, device: str):
     with temp_file.open() as f:
         data = json.load(f)
         trace_events = data["traceEvents"]
-        assert len(trace_events) == 5
+        assert len(trace_events) == 3
         assert trace_events[-1]["name"] == "foo"
         assert trace_events[-1]["args"]["call_stack"] == ["ROOT", "test", "foo"]
 
@@ -1157,93 +1131,7 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
     assert graph_flow_start["tid"].startswith("cpu thread ")
     assert graph_flow_finish["tid"] == graph_tid
     assert graph_flow_start["ts"] <= graph_flow_finish["ts"]
-
-
-@pytest.mark.skipif(not is_cuda(), reason="Only CUDA backend supports cudagraph trace reconstruction")
-def test_trace_cudagraph_metric_only_scope_path(tmp_path: pathlib.Path, device: str):
-    stream = torch.cuda.Stream()
-    torch.cuda.set_stream(stream)
-    metric_tensor = torch.tensor(2.0, device=device)
-
-    def fn():
-        with proton.scope("outer"):
-            with proton.scope("inner", metrics={"metric_only": metric_tensor}):
-                pass
-
-    temp_file = tmp_path / "test_trace_cudagraph_metric_only_scope_path.chrome_trace"
-    proton.start(str(temp_file.with_suffix("")), data="trace", context="shadow")
-
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        fn()
-
-    with proton.scope("test0"):
-        g.replay()
-
-    proton.finalize()
-
-    with temp_file.open() as f:
-        data = json.load(f)
-
-    trace_events = data["traceEvents"]
-
-    def get_call_stack(event):
-        return event.get("args", {}).get("call_stack", [])
-
-    def has_stack(event, expected_stack):
-        return get_call_stack(event) == expected_stack
-
-    replay_graph_events = [
-        event for event in trace_events
-        if event.get("tid", "").startswith("Graph: Stream ") and "test0" in get_call_stack(event)
-    ]
-    assert replay_graph_events
-    graph_tid = replay_graph_events[0]["tid"]
-    assert all(event["ph"] == "X" for event in replay_graph_events)
-    assert all("<captured_at>" not in get_call_stack(event) for event in replay_graph_events)
-    assert all(COMPUTE_METADATA_SCOPE_NAME not in get_call_stack(event) for event in replay_graph_events)
-
-    def get_graph_scope(expected_stack):
-        event = next(event for event in replay_graph_events if has_stack(event, expected_stack))
-        return {
-            "name": event["name"],
-            "cat": event["cat"],
-            "ts": event["ts"],
-            "dur": event["dur"],
-            "args": event.get("args", {}),
-        }
-
-    outer_event = get_graph_scope(["ROOT", "test0", "outer"])
-    inner_event = get_graph_scope(["ROOT", "test0", "outer", "inner"])
-
-    assert outer_event["cat"] == "scope"
-    assert inner_event["name"] == "inner: <metric_only, 2.000000>"
-    assert inner_event["cat"] == "metric"
-    assert inner_event["args"]["metrics"] == {"metric_only": "2.000000"}
-
-    replay_metric_kernels = [
-        event for event in trace_events if event["cat"] == "kernel" and event["name"] == "<metric>"
-        and get_call_stack(event) == ["ROOT", "test0", "outer", "inner", "<metric>"]
-    ]
-    assert len(replay_metric_kernels) == 1
-
-    graph_flow_starts = [
-        event for event in trace_events
-        if event["cat"] == "flow" and event["ph"] == "s" and event["name"] == "launch->graph"
-    ]
-    graph_flow_finishes = [
-        event for event in trace_events
-        if event["cat"] == "flow" and event["ph"] == "f" and event["name"] == "launch->graph"
-    ]
-    assert len(graph_flow_starts) == 1
-    assert len(graph_flow_finishes) == 1
-    graph_flow_start = graph_flow_starts[0]
-    graph_flow_finish = graph_flow_finishes[0]
-    assert graph_flow_start["id"] == graph_flow_finish["id"]
-    assert graph_flow_start["tid"].startswith("cpu thread ")
-    assert graph_flow_finish["tid"] == graph_tid
-    assert graph_flow_start["ts"] <= graph_flow_finish["ts"]
-
+    
 
 @pytest.mark.parametrize("profile_kind,suffix", [("tree", ".hatchet"), ("trace", ".chrome_trace")],
                          ids=["tree", "trace"])

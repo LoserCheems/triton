@@ -854,9 +854,9 @@ void dumpCpuToGpuFlowEvents(
   }
 
   for (const auto &[streamId, events] : kernelEvents) {
-    auto prevLaunchEventId = std::numeric_limits<size_t>::max();
+    auto prevLaunchEventId = TraceData::Trace::Event::DummyId;
     for (const auto &event : events) {
-      if (event.launchEventId == std::numeric_limits<size_t>::max()) {
+      if (event.launchEventId == TraceData::Trace::Event::DummyId) {
         // This kernel event is not linked to any CPU scope event, skip it.
         continue;
       }

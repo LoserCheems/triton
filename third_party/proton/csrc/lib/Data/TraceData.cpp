@@ -321,7 +321,6 @@ struct CpuScopeEvent {
 struct GraphScopeEvent {
   Context context;
   size_t streamId{};
-  size_t launchEventId{std::numeric_limits<size_t>::max()};
   uint64_t startTimeNs{};
   uint64_t endTimeNs{};
   const DataEntry::FlexibleMetricMap *flexibleMetrics{};
@@ -658,7 +657,6 @@ void reconstructGraphScopeEvents(
     std::map<size_t, std::vector<GraphScopeEvent>> &graphScopeEvents) {
   struct OpenGraphScope {
     Context context;
-    size_t launchEventId{};
     uint64_t startTimeNs{};
   };
   std::map</*stream_id=*/size_t, std::vector<OpenGraphScope>> openGraphScopes;
@@ -700,8 +698,7 @@ void reconstructGraphScopeEvents(
       if (openScopes.empty()) {
         // There's no open graph scope, we start a new stack of scopes
         for (const auto &context : graphContexts) {
-          openScopes.push_back(
-              {context, kernelEvent.launchEventId, startTimeNs});
+          openScopes.push_back({context, startTimeNs});
         }
       } else {
         auto numCommonPrefixes = 0;
@@ -717,8 +714,8 @@ void reconstructGraphScopeEvents(
           // Close scopes that are not in the common prefix
           auto &tailOpenScope = openScopes[i - 1];
           graphScopeEvents[streamId].push_back(
-              {tailOpenScope.context, streamId, tailOpenScope.launchEventId,
-               tailOpenScope.startTimeNs, lastEndTimeNs});
+              {tailOpenScope.context, streamId, tailOpenScope.startTimeNs,
+               lastEndTimeNs});
         }
         for (size_t i = openScopes.size(); i > numCommonPrefixes; --i) {
           // Remove scopes that are not in the common prefix
@@ -727,8 +724,7 @@ void reconstructGraphScopeEvents(
         for (size_t i = numCommonPrefixes; i < graphContexts.size(); ++i) {
           // Open scopes that are not in the common prefix
           const auto &context = graphContexts[i];
-          openScopes.push_back(
-              {context, kernelEvent.launchEventId, startTimeNs});
+          openScopes.push_back({context, startTimeNs});
         }
       }
       lastEndTimeNs = std::max(lastEndTimeNs, endTimeNs);
@@ -737,8 +733,7 @@ void reconstructGraphScopeEvents(
     auto &openScopes = openGraphScopes[streamId];
     for (const auto &openScope : openScopes) {
       graphScopeEvents[streamId].push_back(
-          {openScope.context, streamId, openScope.launchEventId,
-           openScope.startTimeNs, lastEndTimeNs});
+          {openScope.context, streamId, openScope.startTimeNs, lastEndTimeNs});
     }
   }
 }
@@ -859,15 +854,21 @@ void dumpCpuToGpuFlowEvents(
   }
 
   for (const auto &[streamId, events] : kernelEvents) {
+    auto prevLaunchEventId = std::numeric_limits<size_t>::max();
     for (const auto &event : events) {
-      if (event.isGraphLinked ||
-          event.launchEventId == std::numeric_limits<size_t>::max()) {
+      if (prevLaunchEventId == event.launchEventId && event.isGraphLinked) {
+        // For back-to-back kernel launches linked to the same CPU scope event,
+        // we only create flow events for the first one to avoid creating
+        // duplicated flow events that overlap with each other and cause visual
+        // clutter
         continue;
       }
       auto launchEventIt =
           launchEventIdToCpuScopeEvent.find(event.launchEventId);
       if (launchEventIt == launchEventIdToCpuScopeEvent.end()) {
-        continue;
+        throw std::runtime_error(
+            "Cannot find CPU scope event for kernel launch event id: " +
+            std::to_string(event.launchEventId));
       }
 
       const auto *launchEvent = launchEventIt->second;
@@ -897,62 +898,7 @@ void dumpCpuToGpuFlowEvents(
       finishElement["id"] = event.launchEventId;
       finishElement["bp"] = "e";
       object["traceEvents"].push_back(std::move(finishElement));
-    }
-  }
-}
-
-void dumpCpuToGraphFlowEvents(
-    uint64_t minTimeStamp,
-    const std::map<size_t, std::vector<CpuScopeEvent>> &cpuScopeEvents,
-    const std::map<size_t, std::vector<GraphScopeEvent>> &graphScopeEvents,
-    json &object) {
-  std::unordered_map<size_t, const CpuScopeEvent *>
-      launchEventIdToCpuScopeEvent;
-  for (const auto &[_, events] : cpuScopeEvents) {
-    for (const auto &event : events) {
-      launchEventIdToCpuScopeEvent.emplace(event.eventId, &event);
-    }
-  }
-
-  for (const auto &[streamId, events] : graphScopeEvents) {
-    for (const auto &event : events) {
-      if (event.context.name != GraphState::captureTag) {
-        continue;
-      }
-      auto launchEventIt =
-          launchEventIdToCpuScopeEvent.find(event.launchEventId);
-      if (launchEventIt == launchEventIdToCpuScopeEvent.end()) {
-        continue;
-      }
-
-      const auto *launchEvent = launchEventIt->second;
-      // Ensure <captured_at> is active
-      const auto flowFinishTimeNs = event.endTimeNs - 1;
-      const auto flowStartTimeNs = launchEvent->startTimeNs;
-
-      json startElement;
-      startElement["name"] = "launch->graph";
-      startElement["cat"] = "flow";
-      startElement["ph"] = "s";
-      startElement["pid"] = kTraceProcessId;
-      startElement["tid"] = getCpuLaneId(launchEvent->threadId);
-      startElement["ts"] =
-          static_cast<double>(flowStartTimeNs - minTimeStamp) / 1000.0;
-      startElement["id"] = event.launchEventId;
-      startElement["bp"] = "e";
-      object["traceEvents"].push_back(std::move(startElement));
-
-      json finishElement;
-      finishElement["name"] = "launch->graph";
-      finishElement["cat"] = "flow";
-      finishElement["ph"] = "f";
-      finishElement["pid"] = kTraceProcessId;
-      finishElement["tid"] = getGraphLaneId(streamId);
-      finishElement["ts"] =
-          static_cast<double>(flowFinishTimeNs - minTimeStamp) / 1000.0;
-      finishElement["id"] = event.launchEventId;
-      finishElement["bp"] = "e";
-      object["traceEvents"].push_back(std::move(finishElement));
+      prevLaunchEventId = event.launchEventId;
     }
   }
 }
@@ -968,8 +914,6 @@ void dumpKernelMetricTrace(
   emitTraceLaneMetadata(object, cpuScopeEvents, graphScopeEvents, kernelEvents);
   dumpCpuScopeEvents(minTimeStamp, cpuScopeEvents, object, os);
   dumpGraphScopeEvents(minTimeStamp, graphScopeEvents, object, os);
-  dumpCpuToGraphFlowEvents(minTimeStamp, cpuScopeEvents, graphScopeEvents,
-                           object);
   dumpCpuToGpuFlowEvents(minTimeStamp, cpuScopeEvents, kernelEvents, object);
   dumpKernelEvents(minTimeStamp, kernelEvents, object, os);
 
@@ -1044,8 +988,9 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
                 kernelMetric->getValue(KernelMetric::StartTime));
             auto launchEventId = events.at(eventId).parentEventId;
             if (isGraphLinked) {
-              // For graph-linked kernels, the parent is the <captured_at> tag.
-              // So we need to go one level up to find the actual launch event
+              // For graph-linked kernels, the parent maybe the <captured_at>
+              // tag. So we need to go one level up to find the actual launch
+              // event
               launchEventId = events.at(launchEventId).parentEventId;
             }
             kernelEvents[streamId].emplace_back(kernelMetric, flexibleMetrics,

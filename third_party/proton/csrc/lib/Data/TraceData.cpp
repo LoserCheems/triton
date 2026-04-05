@@ -731,14 +731,9 @@ void reconstructGraphScopeEvents(
 
     auto &openScopes = openGraphScopes[streamId];
     for (const auto &openScope : openScopes) {
-      auto adjustedStartTimeNs = openScope.startTimeNs;
-      if (openScope.context.name == GraphState::captureTag) {
-        // Ensure perfectly nested captured scope
-        adjustedStartTimeNs = openScope.startTimeNs - 1;
-      }
       graphScopeEvents[streamId].push_back(
           {openScope.context, streamId, openScope.launchEventId,
-           adjustedStartTimeNs, lastEndTimeNs});
+           openScope.startTimeNs, lastEndTimeNs});
     }
   }
 }

@@ -905,12 +905,13 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
 
     assert (len(kernel_events), len(metric_events), len(scope_events), len(flow_events)) == (4, 3, 4, 8)
 
-    assert {tuple(event["args"]["call_stack"]) for event in kernel_events} == {
-        ("ROOT", "scope_3", "scope_2", "scope_1", "foo"),
-        ("ROOT", "scope_3", "scope_2", "scope_4", "foo"),
-        ("ROOT", "scope_3", "scope_2", "scope_5", "foo"),
-        ("ROOT", "scope_3", "scope_6", "scope_7", "foo"),
-    }
+    assert {tuple(event["args"]["call_stack"])
+            for event in kernel_events} == {
+                ("ROOT", "scope_3", "scope_2", "scope_1", "foo"),
+                ("ROOT", "scope_3", "scope_2", "scope_4", "foo"),
+                ("ROOT", "scope_3", "scope_2", "scope_5", "foo"),
+                ("ROOT", "scope_3", "scope_6", "scope_7", "foo"),
+            }
 
     metric_by_name = {next(iter(event["args"]["metrics"])): event for event in metric_events}
     assert {
@@ -922,12 +923,13 @@ def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str
         "m3": ("scope_3: <m3, 3.000000>", ("ROOT", "scope_3"), {"m3": "3.000000"}),
     }
 
-    assert {tuple(event["args"]["call_stack"]) for event in scope_events} == {
-        ("ROOT", "scope_3", "scope_2", "scope_4"),
-        ("ROOT", "scope_3", "scope_2", "scope_5"),
-        ("ROOT", "scope_3", "scope_6"),
-        ("ROOT", "scope_3", "scope_6", "scope_7"),
-    }
+    assert {tuple(event["args"]["call_stack"])
+            for event in scope_events} == {
+                ("ROOT", "scope_3", "scope_2", "scope_4"),
+                ("ROOT", "scope_3", "scope_2", "scope_5"),
+                ("ROOT", "scope_3", "scope_6"),
+                ("ROOT", "scope_3", "scope_6", "scope_7"),
+            }
 
     gpu_tid = kernel_events[0]["tid"]
     cpu_tid = metric_by_name["m1"]["tid"]
@@ -1020,11 +1022,12 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
     metric_kernel_events = [event for event in replay_kernel_events if event["name"] == "<metric>"]
 
     assert len(foo_events) == 3
-    assert {tuple(event["args"]["call_stack"]) for event in foo_events} == {
-        ("ROOT", "test0", "<captured_at>", "a", "b", "c", "foo"),
-        ("ROOT", "test0", "<captured_at>", "a", "b", "foo"),
-        ("ROOT", "test0", "<captured_at>", "a", "foo"),
-    }
+    assert {tuple(event["args"]["call_stack"])
+            for event in foo_events} == {
+                ("ROOT", "test0", "<captured_at>", "a", "b", "c", "foo"),
+                ("ROOT", "test0", "<captured_at>", "a", "b", "foo"),
+                ("ROOT", "test0", "<captured_at>", "a", "foo"),
+            }
     assert len(metric_kernel_events) == 1
     assert metric_kernel_events[0]["args"]["call_stack"] == [
         "ROOT", "test0", "<captured_at>", "a", "b", "c", "<metric>"
@@ -1032,25 +1035,17 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
 
     test0_scope = next(
         event for event in trace_events
-        if event.get("cat") == "scope" and event.get("args", {}).get("call_stack", []) == ["ROOT", "test0"]
-    )
+        if event.get("cat") == "scope" and event.get("args", {}).get("call_stack", []) == ["ROOT", "test0"])
     replay_gpu_tid = foo_events[0]["tid"]
     first_replay_kernel = min(replay_kernel_events, key=lambda event: event["ts"])
-    flow_finish = next(
-        event for event in trace_events
-        if event.get("cat") == "flow"
-        and event["ph"] == "f"
-        and event["name"] == "launch->kernel"
-        and event["tid"] == replay_gpu_tid
-        and event["ts"] == first_replay_kernel["ts"]
-    )
-    flow_start = next(
-        event for event in trace_events
-        if event.get("cat") == "flow" and event["ph"] == "s" and event["id"] == flow_finish["id"]
-    )
+    flow_finish = next(event for event in trace_events
+                       if event.get("cat") == "flow" and event["ph"] == "f" and event["name"] == "launch->kernel"
+                       and event["tid"] == replay_gpu_tid and event["ts"] == first_replay_kernel["ts"])
+    flow_start = next(event for event in trace_events
+                      if event.get("cat") == "flow" and event["ph"] == "s" and event["id"] == flow_finish["id"])
     assert flow_start["tid"] == test0_scope["tid"]
     assert test0_scope["ts"] == flow_start["ts"] <= flow_finish["ts"]
-    
+
 
 @pytest.mark.parametrize("profile_kind,suffix", [("tree", ".hatchet"), ("trace", ".chrome_trace")],
                          ids=["tree", "trace"])

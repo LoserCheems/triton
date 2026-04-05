@@ -713,9 +713,9 @@ void reconstructGraphScopeEvents(
         for (size_t i = openScopes.size(); i > numCommonPrefixes; --i) {
           // Close scopes that are not in the common prefix
           auto &tailOpenScope = openScopes[i - 1];
-          graphScopeEvents[streamId].push_back(
-              {tailOpenScope.context, streamId, tailOpenScope.startTimeNs,
-               lastEndTimeNs});
+          graphScopeEvents[streamId].push_back({tailOpenScope.context, streamId,
+                                                tailOpenScope.startTimeNs,
+                                                lastEndTimeNs});
         }
         for (size_t i = openScopes.size(); i > numCommonPrefixes; --i) {
           // Remove scopes that are not in the common prefix

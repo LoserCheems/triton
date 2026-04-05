@@ -731,9 +731,14 @@ void reconstructGraphScopeEvents(
 
     auto &openScopes = openGraphScopes[streamId];
     for (const auto &openScope : openScopes) {
+      auto adjustedEndTimeNs = lastEndTimeNs;
+      if (openScope.context.name == GraphState::captureTag) {
+        // Ensure perfectly nested captured scope
+        adjustedEndTimeNs = lastEndTimeNs + 2;
+      }
       graphScopeEvents[streamId].push_back(
           {openScope.context, streamId, openScope.launchEventId,
-           openScope.startTimeNs, lastEndTimeNs});
+           openScope.startTimeNs, adjustedEndTimeNs});
     }
   }
 }
@@ -833,7 +838,6 @@ void dumpGraphScopeEvents(
       element["dur"] =
           static_cast<double>(event.endTimeNs - event.startTimeNs) / 1000.0;
       element["tid"] = graphTid;
-      element["args"]["call_stack"] = buildCallStackJson(event.context);
       object["traceEvents"].push_back(std::move(element));
     }
   }
@@ -916,7 +920,8 @@ void dumpCpuToGraphFlowEvents(
       }
 
       const auto *launchEvent = launchEventIt->second;
-      const auto flowFinishTimeNs = event.endTimeNs - 1;
+      // Ensure only <captured_at> is active
+      const auto flowFinishTimeNs = event.endTimeNs + 1;
       const auto flowStartTimeNs = launchEvent->startTimeNs;
 
       json startElement;

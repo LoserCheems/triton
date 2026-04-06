@@ -205,11 +205,15 @@ DataEntry TraceData::addOp(size_t phase, size_t eventId,
   auto lock = lockIfCurrentOrVirtualPhase(phase);
   auto *trace = phasePtrAs<Trace>(phase);
   auto parentContextId = 0;
+  size_t threadId = 0;
   if (eventId == Data::kRootEntryId) {
     parentContextId = Trace::TraceContext::RootId;
+    threadId = getCurrentThreadTraceId();
   } else {
     auto &event = trace->getEvent(eventId);
     parentContextId = event.contextId;
+    // Inherit thread id from the parent event
+    threadId = event.threadId;
   }
   const auto contextId = trace->addContexts(contexts, parentContextId);
   size_t parentEventId = Trace::Event::DummyId;
@@ -225,7 +229,7 @@ DataEntry TraceData::addOp(size_t phase, size_t eventId,
   const auto newEventId = trace->addEvent(contextId, parentEventId);
   auto &newEvent = trace->getEvent(newEventId);
   // This is an instant or a GPU event, no CPU time range
-  newEvent.threadId = getCurrentThreadTraceId();
+  newEvent.threadId = threadId;
   return DataEntry(newEventId, phase, newEvent.metricSet);
 }
 

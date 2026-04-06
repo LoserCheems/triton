@@ -870,6 +870,7 @@ def test_trace(tmp_path: pathlib.Path, device: str):
         assert trace_events[-1]["args"]["call_stack"] == ["ROOT", "test", "foo"]
 
 
+@pytest.mark.skipif(not is_cuda(), reason="Only CUDA backend supports metrics profiling in cudagraphs")
 def test_trace_flexible_metrics_scope_ranges(tmp_path: pathlib.Path, device: str):
 
     @triton.jit

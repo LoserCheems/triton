@@ -75,8 +75,9 @@ def compute_num_stages(
 ):
     if precision_config.max_num_imprecise_acc is not None:
         return 3
+    lhs_size = bitwidth(lhs_dtype) / 8
     weight_size = bitwidth(rhs_dtype) / 8
-    stage_size = block_m * block_k * lhs_dtype.itemsize + block_k * block_n * weight_size
+    stage_size = block_m * block_k * lhs_size + block_k * block_n * weight_size
     device_props = torch.cuda.get_device_properties(0)
     smem_capacity = device_props.shared_memory_per_block_optin
     has_native_mxfp = target_info.cuda_capability_geq(10, 0)

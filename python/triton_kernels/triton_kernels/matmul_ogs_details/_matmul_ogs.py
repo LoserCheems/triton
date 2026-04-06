@@ -119,9 +119,12 @@ def _matmul_ogs(
     if is_x_microscaled:
         x_type: tl.constexpr = X.dtype.element_ty
         tl.static_assert(is_w_microscaled)
-        tl.static_assert(x_type == tl.float8e4nv, "mx_act_ptr must be float8e4nv")
+        tl.static_assert(x_type == tl.float8e4nv or x_type == tl.uint8, "mx_act_ptr must be float8e4nv or uint8")
         tl.static_assert(XMxScale.dtype.element_ty == tl.uint8, "mx_scale_ptr must be uint8")
         tl.static_assert(BLOCK_K % MX_PACK_DIVISOR == 0, "BLOCK_K must be a multiple of MX_PACK_DIVISOR")
+        X_K_DIVISOR: tl.constexpr = 2 if x_type == tl.uint8 else 1
+    else:
+        X_K_DIVISOR: tl.constexpr = 1
     is_out_microscaled: tl.constexpr = stride_y_mx_z is not None
 
     OUT_BLOCK_N: tl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
@@ -197,7 +200,8 @@ def _matmul_ogs(
         # no needs to bounds-check here because `offs_x_m` wraps around M dim
         offs_x_m = tl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
     offs_k = BLOCK_K * pid_k + tl.arange(0, BLOCK_K)
-    XPtrs = X + offs_x_m.to(index_type)[:, None] * stride_x_m + offs_k.to(index_type)[None, :] * stride_x_k
+    offs_x_k = (BLOCK_K // X_K_DIVISOR) * pid_k + tl.arange(0, BLOCK_K // X_K_DIVISOR)
+    XPtrs = X + offs_x_m.to(index_type)[:, None] * stride_x_m + offs_x_k.to(index_type)[None, :] * stride_x_k
 
     # TODO: refactor if/else when triton front end improves
     if is_w_microscaled:
@@ -292,6 +296,7 @@ def _matmul_ogs(
     for k in range(K, BLOCK_K * pid_k, -(BLOCK_K * SPLIT_K)):
         if EVEN_K:
             mask_k = tl.full([BLOCK_K], True, dtype=tl.int1)
+            mask_k_x = tl.full([BLOCK_K // X_K_DIVISOR], True, dtype=tl.int1)
             mask_k_w = tl.full([PACKED_BLOCK_K_W], True, dtype=tl.int1)
             if is_w_microscaled and SWIZZLE_MX_SCALE is None:
                 mask_k_scale = tl.full([PACKED_MX_BLOCK], True, dtype=tl.int1)
@@ -299,13 +304,14 @@ def _matmul_ogs(
                 mask_x_k_scale = tl.full([MX_SCALE_BLOCK_K], True, dtype=tl.int1)
         else:
             mask_k = offs_k < k
+            mask_k_x = offs_x_k < (k // X_K_DIVISOR)
             mask_k_w = offs_w_k < ((k // (W_K_DIVISOR if W_TRANSPOSE else 1)) * W_K_MULTIPLIER)
             if is_w_microscaled and SWIZZLE_MX_SCALE is None:
                 mask_k_scale = offs_k_scale * MX_PACK_DIVISOR < k
             if is_x_microscaled:
                 mask_x_k_scale = offs_x_k_scale * MX_PACK_DIVISOR < k
 
-        x = tl.load(XPtrs, mask=mask_k[None, :], other=0.0)
+        x = tl.load(XPtrs, mask=mask_k_x[None, :], other=0.0)
         w = tl.load(WPtrs, mask=mask_k_w[:, None], other=0.0, cache_modifier=W_CACHE_MODIFIER)
         if is_w_microscaled:
             x_format: tl.constexpr = get_scaled_dot_format_string(x.dtype)
@@ -342,8 +348,20 @@ def _matmul_ogs(
                 acc = tl.dot(w, x, acc, max_num_imprecise_acc=MAX_NUM_IMPRECISE_ACC, allow_tf32=ALLOW_TF32)
                 acc = acc.trans()
             else:
+                lhs_k_pack: tl.constexpr = is_x_microscaled and X_K_DIVISOR == 2
                 rhs_k_pack: tl.constexpr = W_TRANSPOSE or not is_w_microscaled or W_K_DIVISOR != 2
-                acc = tl.dot_scaled(x, x_scales, x_format, w, w_scales, w_format, acc=acc, fast_math=True, rhs_k_pack=rhs_k_pack)
+                acc = tl.dot_scaled(
+                    x,
+                    x_scales,
+                    x_format,
+                    w,
+                    w_scales,
+                    w_format,
+                    acc=acc,
+                    fast_math=True,
+                    lhs_k_pack=lhs_k_pack,
+                    rhs_k_pack=rhs_k_pack,
+                )
             if SWIZZLE_MX_SCALE == "BLACKWELL_SCALE":
                 WMxScalePtrs += (MX_SCALE_BLOCK_K // 4 * SPLIT_K) * stride_w_mx_k
             else:
@@ -352,7 +370,7 @@ def _matmul_ogs(
                 XMxScalePtrs += (MX_SCALE_BLOCK_K * SPLIT_K) * stride_x_mx_k
         else:
             acc = tl.dot(x, w, acc, max_num_imprecise_acc=MAX_NUM_IMPRECISE_ACC, allow_tf32=ALLOW_TF32)
-        XPtrs += (BLOCK_K * SPLIT_K) * stride_x_k
+        XPtrs += ((BLOCK_K // X_K_DIVISOR) * SPLIT_K) * stride_x_k
         WPtrs += (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
     # bias + scale
     offs_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)

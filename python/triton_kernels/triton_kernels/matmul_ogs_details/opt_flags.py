@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import triton
 from triton_kernels.target_info import get_cdna_version
 import torch
+from triton_kernels.tensor import bitwidth
 from .opt_flags_details import opt_flags_amd, opt_flags_nvidia
 
 
@@ -174,7 +175,8 @@ def make_default_opt_flags_nvidia(
         is_persistent = constraints["is_persistent"]
     else:
         has_simple_epilogue = precision_config.max_num_imprecise_acc is None
-        is_persistent = supports_persistent and has_simple_epilogue and (tiles_per_sm >= 2.0 or lhs_dtype.itemsize <= 1) and out_dtype.itemsize < 4
+        lhs_itemsize = bitwidth(lhs_dtype) / 8
+        is_persistent = supports_persistent and has_simple_epilogue and (tiles_per_sm >= 2.0 or lhs_itemsize <= 1) and out_dtype.itemsize < 4
         # TEMP CHANGE
         if precision_config.act_scale is not None or precision_config.out_scale is not None:
             is_persistent = False

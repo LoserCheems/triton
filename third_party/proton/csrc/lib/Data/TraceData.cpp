@@ -924,6 +924,15 @@ void dumpKernelMetricTrace(
   os << object.dump() << "\n";
 }
 
+void dumpCpuOnlyTrace(
+    uint64_t minTimeStamp,
+    std::map<size_t, std::vector<CpuScopeEvent>> &cpuScopeEvents,
+    std::ostream &os) {
+  json object = {{"displayTimeUnit", "us"}, {"traceEvents", json::array()}};
+  dumpCpuScopeEvents(minTimeStamp, cpuScopeEvents, object, os);
+  os << object.dump() << "\n";
+}
+
 } // namespace
 
 void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
@@ -1056,6 +1065,14 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
       return;
     }
 
+    // Keep CPU ranges stable regardless of whether kernels were recorded.
+    for (auto &[threadId, events] : cpuScopeEvents) {
+      std::sort(events.begin(), events.end(),
+                [](const CpuScopeEvent &a, const CpuScopeEvent &b) {
+                  return a.startTimeNs < b.startTimeNs;
+                });
+    }
+
     if (hasKernelMetrics) {
       // Sort all kernel events in order
       for (auto &[streamId, events] : kernelEvents) {
@@ -1068,17 +1085,12 @@ void TraceData::dumpChromeTrace(std::ostream &os, size_t phase) const {
                     return aStartTime < bStartTime;
                   });
       }
-      // Sort CPU scope events by start time
-      for (auto &[threadId, events] : cpuScopeEvents) {
-        std::sort(events.begin(), events.end(),
-                  [](const CpuScopeEvent &a, const CpuScopeEvent &b) {
-                    return a.startTimeNs < b.startTimeNs;
-                  });
-      }
       // Graph scopes are constructed in order
       reconstructGraphScopeEvents(kernelEvents, graphScopeEvents);
       dumpKernelMetricTrace(minTimeStamp, kernelEvents, cpuScopeEvents,
                             graphScopeEvents, os);
+    } else if (!cpuScopeEvents.empty()) {
+      dumpCpuOnlyTrace(minTimeStamp, cpuScopeEvents, os);
     } else {
       os << json({{"displayTimeUnit", "us"}, {"traceEvents", json::array()}})
                 .dump()

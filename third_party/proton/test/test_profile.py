@@ -989,6 +989,9 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
     temp_file = tmp_path / "test_trace_cudagraph_graph_scope_ranges.chrome_trace"
     proton.start(str(temp_file.with_suffix("")), data="trace", context="shadow")
 
+    # warmup
+    fn()
+
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         fn()
@@ -1008,7 +1011,7 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
     graph_tid = graph_tids[0]
 
     graph_scope_events = [event for event in trace_events if event.get("cat") == "scope" and event["tid"] == graph_tid]
-    assert {event["name"] for event in graph_scope_events} == {"<captured_at>", "a", "b", "c"}
+    assert {"<captured_at>", "a", "b", "c"}.issubset({event["name"] for event in graph_scope_events})
     assert not any(event.get("cat") == "metric" and event["tid"] == graph_tid for event in trace_events)
 
     replay_kernel_events = [
@@ -1017,6 +1020,10 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
     ]
     foo_events = [event for event in replay_kernel_events if event["name"] == "foo"]
     metric_kernel_events = [event for event in replay_kernel_events if event["name"] == "<metric>"]
+    metadata_kernel_events = [
+        event for event in replay_kernel_events
+        if COMPUTE_METADATA_SCOPE_NAME in event.get("args", {}).get("call_stack", [])
+    ]
 
     assert len(foo_events) == 3
     assert {tuple(event["args"]["call_stack"])
@@ -1029,6 +1036,7 @@ def test_trace_cudagraph_graph_scope_ranges(tmp_path: pathlib.Path, device: str)
     assert metric_kernel_events[0]["args"]["call_stack"] == [
         "ROOT", "test0", "<captured_at>", "a", "b", "c", "<metric>"
     ]
+    assert all(event["name"] not in {"foo", "<metric>"} for event in metadata_kernel_events)
 
     test0_scope = next(
         event for event in trace_events

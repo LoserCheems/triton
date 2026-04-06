@@ -749,6 +749,8 @@ void dumpKernelEvents(uint64_t minTimeStamp,
           std::get<uint64_t>(kernelMetric->getValue(KernelMetric::StartTime));
       uint64_t endTimeNs =
           std::get<uint64_t>(kernelMetric->getValue(KernelMetric::EndTime));
+      bool isMetricKernel = static_cast<bool>(std::get<uint64_t>(
+          kernelMetric->getValue(KernelMetric::IsMetricKernel)));
       // Convert nanoseconds to microseconds for Chrome trace format
       double ts = static_cast<double>(startTimeNs - minTimeStamp) / 1000;
       double dur = static_cast<double>(endTimeNs - startTimeNs) / 1000;
@@ -756,7 +758,7 @@ void dumpKernelEvents(uint64_t minTimeStamp,
       const auto &contexts = event.contexts;
 
       json element;
-      if (flexibleMetrics) {
+      if (isMetricKernel) {
         element["name"] = GraphState::metricTag;
       } else {
         element["name"] = contexts.back().name;

@@ -383,7 +383,8 @@ def matmul_ogs(x, w, bias,
     if x_scale is not None and not isinstance(x_scale, Tensor):
         x_scale = Tensor(x_scale)
     if not isinstance(x, Tensor):
-        x = Tensor(x, dtype=x.dtype)
+        dtype = FP4 if x_has_mx and x.dtype == torch.uint8 else x.dtype
+        x = wrap_torch_tensor(x, dtype=dtype)
     x_transpose = x.stride(-1) != 1
     # determine shapes
     has_gather = gather_indx is not None

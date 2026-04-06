@@ -204,15 +204,29 @@ DataEntry TraceData::addOp(size_t phase, size_t eventId,
                            const std::vector<Context> &contexts) {
   auto lock = lockIfCurrentOrVirtualPhase(phase);
   auto *trace = phasePtrAs<Trace>(phase);
+  auto parentContextId = 0;
   if (eventId == Data::kRootEntryId) {
-    eventId = trace->addEvent(Trace::TraceContext::RootId);
+    parentContextId = Trace::TraceContext::RootId;
+  } else {
     auto &event = trace->getEvent(eventId);
-    // This is an instant or a GPU event, no CPU time range
-    event.threadId = getCurrentThreadTraceId();
-    return DataEntry(eventId, phase, event.metricSet);
+    parentContextId = event.contextId;
   }
-  auto &event = trace->getEvent(eventId);
-  return DataEntry(eventId, phase, event.metricSet);
+  const auto contextId = trace->addContexts(contexts, parentContextId);
+  size_t parentEventId = Trace::Event::DummyId;
+  if (eventId == Data::kRootEntryId) {
+    auto activeEventStackIt = traceDataToActiveEventStack.find(this);
+    if (activeEventStackIt != traceDataToActiveEventStack.end() &&
+        !activeEventStackIt->second.empty()) {
+      parentEventId = activeEventStackIt->second.back();
+    }
+  } else {
+    parentEventId = eventId;
+  }
+  const auto newEventId = trace->addEvent(contextId, parentEventId);
+  auto &newEvent = trace->getEvent(newEventId);
+  // This is an instant or a GPU event, no CPU time range
+  newEvent.threadId = getCurrentThreadTraceId();
+  return DataEntry(newEventId, phase, newEvent.metricSet);
 }
 
 void TraceData::addMetrics(

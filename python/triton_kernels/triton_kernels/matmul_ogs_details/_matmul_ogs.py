@@ -348,7 +348,7 @@ def _matmul_ogs(
                 acc = tl.dot(w, x, acc, max_num_imprecise_acc=MAX_NUM_IMPRECISE_ACC, allow_tf32=ALLOW_TF32)
                 acc = acc.trans()
             else:
-                lhs_k_pack: tl.constexpr = is_x_microscaled and X_K_DIVISOR == 2
+                lhs_k_pack: tl.constexpr = not is_x_microscaled or X_K_DIVISOR == 2
                 rhs_k_pack: tl.constexpr = W_TRANSPOSE or not is_w_microscaled or W_K_DIVISOR != 2
                 acc = tl.dot_scaled(
                     x,

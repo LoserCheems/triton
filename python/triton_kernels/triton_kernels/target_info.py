@@ -47,7 +47,7 @@ def has_tma_gather():
 
 @triton.constexpr_function
 def has_native_mxfp():
-    return cuda_capability_geq(10, 0)
+    return cuda_capability_geq(10, 0) or is_hip_cdna4() or cuda_capability_geq(12, 0)
 
 
 def num_sms():

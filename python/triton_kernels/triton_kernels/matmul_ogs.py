@@ -362,11 +362,7 @@ def matmul_ogs(x, w, bias,
         assert x.shape[0] == w.shape[0]
     # compute optimization flags
     out_dtype = precision_config.out_dtype or x.dtype
-    can_use_tma = x.numel() > 0 and x.storage.is_tma_compliant() and \
-                  w.numel() > 0 and w.storage.is_tma_compliant() and \
-                 (w_scale is None or w_scale.storage.is_tma_compliant())
-    # hopper w/ mxfp4 doesn't support TMA
-    can_use_tma = can_use_tma and (torch.cuda.get_device_capability()[0] > 9 or bitwidth(w.dtype) != 4)
+    can_use_tma = False
     can_use_fused_scatter = has_scatter and (fused_activation.specs.fn is None) and (epilogue.specs.fn is None) and (routing_data.n_expts_act == 1)
     opt_flags = make_opt_flags(out_dtype, x.dtype, w.dtype, precision_config,
         M, N, K, routing_data, can_use_tma, can_use_fused_scatter, epilogue.effective_itemsize,
